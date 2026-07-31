@@ -1,0 +1,1359 @@
+#!/usr/bin/env python3
+"""macpulse — a Mac health scanner for the AI-development era.
+
+Every Mac cleaner on the market measures the same thing: disk space. Caches, logs,
+language files, "junk". That model was written for a Mac whose problem was a full
+disk, and it is blind to what actually brings a modern developer's Mac to its knees:
+
+  * a 300 KB process pinned at 145% CPU for six days, from an app that was deleted
+    (invisible to every size-based scan, because it is small)
+  * an AI coding assistant where each open session spawns its own full MCP server
+    stack, so ten tabs quietly cost 3-5 GB of duplicated infrastructure
+  * an MCP server that has been failing authentication for weeks but still starts
+    three node processes every single time
+  * a browser that will not launch because a lock file points at a PID that died
+  * headless Chrome instances left behind by browser automation, running for days
+
+None of that is junk on a disk. All of it is live waste, and it is what a machine
+running Claude Code, Cursor, Docker and a dozen MCP servers actually suffers from.
+macpulse looks for exactly these, ranks them by what they cost you, and can fix them.
+
+Read-only by default. Nothing is killed or deleted without --fix.
+
+Usage:
+  macpulse                 scan and print a health report
+  macpulse --ui            open the app window (local, loopback only)
+  macpulse --report        also write an HTML report and open it
+  macpulse --fix           scan, then offer each fix one by one
+  macpulse --fix --yes     apply every safe fix without asking
+  macpulse --json          machine-readable output
+  macpulse --lang az|en|ru force a language (default: follow the system)
+"""
+
+import argparse
+import getpass
+import html
+import json
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import webbrowser
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
+import macpulse_history as hist                            # noqa: E402
+
+VERSION = "1.2.0"
+HOME = pathlib.Path.home()
+PAGE = 16384  # Apple silicon vm_stat page size; corrected at runtime
+GB = 1024 ** 3
+
+# Processes we will never offer to kill, whatever the evidence says. Killing these
+# either takes the session down with it or loses state that cannot be recovered.
+PROTECTED = re.compile(
+    r"/sbin/launchd|WindowServer|loginwindow|coreaudiod|kernel_task|"
+    r"Finder\.app|Dock\.app|SystemUIServer|/usr/libexec/|/System/Library/",
+    re.I,
+)
+
+# Real browser binaries. Deliberately narrow: GitHub Copilot's language server also
+# takes a --headless flag, and matching on the flag alone reports it as a leftover.
+BROWSER_BIN = re.compile(
+    r"(Google Chrome|Chromium|Brave Browser|Microsoft Edge|firefox)"
+    r"(\.app/Contents/MacOS/|/)", re.I
+)
+
+AI_HOSTS = [
+    ("Claude Code", re.compile(r"native-binary/claude|/claude$|/claude\s")),
+    ("Cursor", re.compile(r"Cursor\.app/Contents/MacOS/Cursor$")),
+    ("Windsurf", re.compile(r"Windsurf\.app/Contents/MacOS/")),
+    ("Zed", re.compile(r"Zed\.app/Contents/MacOS/zed$")),
+]
+
+MCP_HINT = re.compile(r"mcp|context7|modelcontextprotocol|npm exec|npx |uvx ", re.I)
+
+# Which pane of the app each finding belongs in.
+CAT_MEMORY, CAT_PROC, CAT_AI, CAT_BROWSER, CAT_CONTAINER = (
+    "memory", "processes", "ai", "browser", "containers")
+
+
+def detect_lang():
+    """Follow the Mac's own language, since this ships to strangers' machines."""
+    env = (os.environ.get("MACPULSE_LANG") or "").lower()[:2]
+    if env in LANGS:
+        return env
+    try:
+        out = subprocess.run(["defaults", "read", "-g", "AppleLocale"],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return FALLBACK
+    code = (out or "").strip().lower()[:2]
+    return code if code in LANGS else FALLBACK
+
+
+# ---------------------------------------------------------------- terminal style
+
+class S:
+    on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    B = "\033[1m" if on else ""
+    D = "\033[2m" if on else ""
+    R = "\033[0m" if on else ""
+    RED = "\033[31m" if on else ""
+    YEL = "\033[33m" if on else ""
+    GRN = "\033[32m" if on else ""
+    CYA = "\033[36m" if on else ""
+    MAG = "\033[35m" if on else ""
+
+
+def hr(char="─", width=None):
+    return char * (width or min(shutil.get_terminal_size((80, 24)).columns, 78))
+
+
+def mb(kb):
+    return f"{kb / 1024:.0f} MB" if kb < 1024 * 1024 else f"{kb / 1048576:.2f} GB"
+
+
+# ---------------------------------------------------------------- data collection
+
+class Proc:
+    __slots__ = ("pid", "ppid", "cpu", "rss", "elapsed", "cputime", "user", "cmd")
+
+    def __init__(self, pid, ppid, cpu, rss, elapsed, cputime, user, cmd):
+        self.pid, self.ppid, self.cpu, self.rss = pid, ppid, cpu, rss
+        self.elapsed, self.cputime, self.user, self.cmd = elapsed, cputime, user, cmd
+
+    def resolve_exe(self):
+        """Return (path, exists).
+
+        macOS is full of executables whose path contains spaces —
+        "/Applications/Google Drive.app/Contents/MacOS/Google Drive" is a single
+        argument, not four. Splitting the command line on whitespace therefore
+        invents paths like "/Applications/Google" that do not exist, and any check
+        built on that will confidently report healthy apps as deleted. So instead of
+        guessing where the path ends, walk the tokens and keep the longest prefix
+        that is a real file on disk. If no prefix is a file, the binary genuinely is
+        gone, and the fallback below reconstructs the path it used to have.
+        """
+        cmd = self.cmd
+        if not cmd.startswith("/"):
+            return cmd.split(" ", 1)[0], True     # relative/kernel names: not our business
+        tokens = cmd.split(" ")
+        acc, best, guess = "", None, []
+        for i, tok in enumerate(tokens):
+            if tok.startswith("-") and i:         # arguments start here
+                break
+            acc = tok if not acc else f"{acc} {tok}"
+            guess.append(tok)
+            if os.path.isfile(acc):
+                best = acc
+        if best:
+            return best, True
+        return " ".join(guess), False
+
+    @property
+    def exe(self):
+        return self.resolve_exe()[0]
+
+    @property
+    def short(self):
+        e = self.exe
+        return e.rsplit("/", 1)[-1] if "/" in e else e[:40]
+
+
+def _dur(text):
+    """Parse ps durations: [[dd-]hh:]mm:ss[.ss] -> seconds."""
+    if not text or text in ("-", "?"):
+        return 0.0
+    days = 0
+    if "-" in text:
+        d, text = text.split("-", 1)
+        days = int(d)
+    parts = [float(p) for p in text.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    h, m, s = parts
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+def processes():
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,%cpu=,rss=,etime=,time=,user=,command="],
+        capture_output=True, text=True,
+    ).stdout
+    procs = []
+    for line in out.splitlines():
+        f = line.split(None, 7)
+        if len(f) < 8:
+            continue
+        try:
+            procs.append(Proc(int(f[0]), int(f[1]), float(f[2]), int(f[3]),
+                              _dur(f[4]), _dur(f[5]), f[6], f[7]))
+        except ValueError:
+            continue
+    return procs
+
+
+def descendants(procs, root_pid):
+    by_parent = {}
+    for p in procs:
+        by_parent.setdefault(p.ppid, []).append(p)
+    out, stack = [], [root_pid]
+    while stack:
+        for child in by_parent.get(stack.pop(), []):
+            out.append(child)
+            stack.append(child.pid)
+    return out
+
+
+def memory():
+    global PAGE
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    m = re.search(r"page size of (\d+)", vm)
+    if m:
+        PAGE = int(m.group(1))
+    stat = {}
+    for line in vm.splitlines()[1:]:
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip().rstrip(".")
+        if v.isdigit():
+            stat[k.strip()] = int(v) * PAGE
+
+    sw = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+    used = float(re.search(r"used\s*=\s*([\d.]+)M", sw).group(1)) if "used" in sw else 0.0
+    total = float(re.search(r"total\s*=\s*([\d.]+)M", sw).group(1)) if "total" in sw else 0.0
+
+    total_ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                   capture_output=True, text=True).stdout or 0)
+    free_pct = 0
+    mp = subprocess.run(["memory_pressure"], capture_output=True, text=True).stdout
+    m = re.search(r"free percentage:\s*(\d+)", mp)
+    if m:
+        free_pct = int(m.group(1))
+
+    boot = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+    m = re.search(r"sec\s*=\s*(\d+)", boot)
+    uptime_days = (time.time() - int(m.group(1))) / 86400 if m else 0
+
+    return {
+        "total": total_ram,
+        "wired": stat.get("Pages wired down", 0),
+        "active": stat.get("Pages active", 0),
+        "compressed": stat.get("Pages occupied by compressor", 0),
+        "swap_used_mb": used,
+        "swap_total_mb": total,
+        "free_pct": free_pct,
+        "uptime_days": uptime_days,
+    }
+
+
+# ---------------------------------------------------------------------- findings
+
+class Finding:
+    """A finding stores message *keys* and parameters, never finished sentences.
+
+    The same scan is rendered into a terminal, a JSON blob and a web page, each of
+    which may be in a different language, so the text has to be produced at render
+    time rather than at detection time.
+    """
+
+    def __init__(self, sev, key, category, title_key, detail_key, params,
+                 cost_kb=0, core_hours=0.0, fix=None, fix_key=None, fix_params=None,
+                 evidence=None):
+        self.sev = sev              # "critical" | "warn" | "info"
+        self.key = key
+        self.category = category
+        self.title_key = title_key
+        self.detail_key = detail_key
+        self.params = params or {}
+        self.cost_kb = cost_kb
+        self.core_hours = core_hours
+        self.fix = fix              # callable(lang) -> str
+        self.fix_key = fix_key
+        self.fix_params = fix_params or {}
+        self.evidence = evidence or []
+
+    def title(self, lang):
+        return t(lang, self.title_key, **self.params)
+
+    def detail(self, lang):
+        return t(lang, self.detail_key, **self.params)
+
+    def fix_label(self, lang):
+        return t(lang, self.fix_key, **self.fix_params) if self.fix_key else None
+
+
+def _killer(pids):
+    def do(lang):
+        killed = 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+        return t(lang, "res.stopped", done=killed, total=len(pids))
+    return do
+
+
+# --- 1. CPU burners: the check no disk cleaner has -------------------------------
+
+def check_cpu_burners(procs, _mem):
+    out = []
+    for p in procs:
+        if PROTECTED.search(p.cmd) or p.elapsed < 3600:
+            continue
+        # Sustained load: how much of its lifetime has this process spent on a core?
+        load = p.cputime / max(p.elapsed, 1)
+        if load < 0.35 and p.cpu < 60:
+            continue
+        hours = p.cputime / 3600
+        if hours < 2:
+            continue
+        mine = p.user == getpass.getuser()
+        out.append(Finding(
+            "critical" if (hours > 20 and load > 0.5) else "warn",
+            f"cpu:{p.pid}", CAT_PROC, "cpu.t", "cpu.d",
+            {"name": p.short, "hours": f"{hours:.0f}", "days": f"{p.elapsed / 86400:.1f}",
+             "pct": f"{load * 100:.0f}", "size": mb(p.rss)},
+            core_hours=hours,
+            fix=_killer([p.pid]) if mine else None,
+            fix_key="fix.stop.one" if mine else None, fix_params={"pid": p.pid},
+            evidence=[p.cmd[:200]],
+        ))
+    return sorted(out, key=lambda f: -f.core_hours)[:6]
+
+
+# --- 2. Ghosts: processes whose binary no longer exists ---------------------------
+
+def check_ghosts(procs, _mem):
+    me = getpass.getuser()
+    groups = {}
+    for p in procs:
+        if PROTECTED.search(p.cmd) or p.user != me:
+            continue
+        # A process younger than a few minutes may simply have been caught mid-update,
+        # with its binary swapped out from under it. Only settled processes count.
+        if p.elapsed < 300:
+            continue
+        path, exists = p.resolve_exe()
+        if exists or not path.startswith("/"):
+            continue
+        groups.setdefault(path, []).append(p)
+
+    out = []
+    for path, members in sorted(groups.items(), key=lambda kv: -sum(p.rss for p in kv[1])):
+        cost = sum(p.rss for p in members)
+        hours = sum(p.cputime for p in members) / 3600
+        oldest = max(p.elapsed for p in members) / 86400
+        params = {
+            "name": path.rsplit("/", 1)[-1],
+            "where_key": "ghost.where.volume" if path.startswith("/Volumes/") else "ghost.where.app",
+            "path": path, "days": f"{oldest:.1f}", "size": mb(cost), "n": len(members),
+        }
+        out.append(Finding(
+            "critical", f"ghost:{path}", CAT_PROC,
+            "ghost.t.many" if len(members) > 1 else "ghost.t", "ghost.d", params,
+            cost_kb=cost, core_hours=hours,
+            fix=_killer([p.pid for p in members]),
+            fix_key="fix.stop.many", fix_params={"n": len(members)},
+            evidence=[p.cmd[:180] for p in members[:3]],
+        ))
+    return out[:5]
+
+
+# --- 3. The AI toolchain audit: the reason this tool exists ------------------------
+
+def _probe_http_mcp(url, timeout=4):
+    """Return (key, params) describing an HTTP/SSE MCP endpoint's real state."""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", str(timeout),
+             "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}', url],
+            capture_output=True, text=True, timeout=timeout + 3,
+        )
+        code = (r.stdout or "").strip()
+    except Exception:
+        return "mcp.unreachable", {}
+    if code in ("401", "403"):
+        return "mcp.unauth", {"code": code}
+    if code in ("000", ""):
+        return "mcp.unreachable", {}
+    return None, {}
+
+
+def check_ai_toolchain(procs, _mem):
+    out = []
+    me = getpass.getuser()
+
+    # a) One MCP stack per session is the multiplier that surprises people.
+    for label, pattern in AI_HOSTS:
+        hosts = [p for p in procs
+                 if p.user == me and pattern.search(p.cmd) and not PROTECTED.search(p.cmd)]
+        if len(hosts) < 2:
+            continue
+        total, rows = 0, []
+        for h in hosts:
+            kids = descendants(procs, h.pid)
+            mcp = [k for k in kids if MCP_HINT.search(k.cmd)]
+            cost = h.rss + sum(k.rss for k in kids)
+            total += cost
+            rows.append(f"PID {h.pid}: {mb(cost)} ({len(mcp)} MCP)")
+        sev = "critical" if total > 2 * 1024 * 1024 else ("warn" if len(hosts) > 3 else "info")
+        out.append(Finding(
+            sev, f"ai:{label}", CAT_AI, "ai.t", "ai.d",
+            {"n": len(hosts), "host": label, "size": mb(total), "each": mb(total / len(hosts))},
+            cost_kb=total, evidence=rows[:10],
+        ))
+
+    # b) A broken MCP server still costs full price, every session.
+    cfg = HOME / ".claude.json"
+    if cfg.is_file():
+        try:
+            servers = json.loads(cfg.read_text()).get("mcpServers", {})
+        except (ValueError, OSError):
+            servers = {}
+        sessions = max(1, len([p for p in procs if AI_HOSTS[0][1].search(p.cmd)]))
+        for name, spec in servers.items():
+            if spec.get("type") in ("http", "sse") and spec.get("url"):
+                vkey, vparams = _probe_http_mcp(spec["url"])
+                if vkey:
+                    out.append(Finding(
+                        "warn", f"mcp:{name}", CAT_AI, "mcpdead.t", "mcpdead.d",
+                        {"name": name, "n": sessions,
+                         "verdict_key": vkey, "verdict_params": vparams},
+                        evidence=[spec["url"]],
+                    ))
+            else:
+                token = (spec.get("args") or [None])[-1] or spec.get("command", "")
+                if not token:
+                    continue
+                live = [p for p in procs if token in p.cmd]
+                cost = sum(p.rss for p in live)
+                if live and cost > 200 * 1024:
+                    out.append(Finding(
+                        "info", f"mcpcost:{name}", CAT_AI, "mcpcost.t", "mcpcost.d",
+                        {"name": name, "size": mb(cost), "n": len(live)},
+                        cost_kb=cost,
+                    ))
+    return out
+
+
+# --- 4. Headless browser leftovers -------------------------------------------------
+
+def check_headless_browsers(procs, _mem):
+    me = getpass.getuser()
+    victims = []
+    for p in procs:
+        if p.user != me or not BROWSER_BIN.search(p.exe):
+            continue
+        if "--headless" not in p.cmd and "--remote-debugging-port" not in p.cmd:
+            continue
+        if "--type=" in p.cmd:      # a child renderer, not the leftover root
+            continue
+        if p.elapsed < 1800:        # a live automation run; leave it alone
+            continue
+        victims.append(p)
+    if not victims:
+        return []
+    cost = sum(p.rss for p in victims)
+    return [Finding(
+        "warn", "headless", CAT_BROWSER, "headless.t", "headless.d",
+        {"n": len(victims), "size": mb(cost),
+         "days": f"{max(v.elapsed for v in victims) / 86400:.1f}"},
+        cost_kb=cost, fix=_killer([p.pid for p in victims]),
+        fix_key="fix.stop.many", fix_params={"n": len(victims)},
+        evidence=[p.cmd[:160] for p in victims[:4]],
+    )]
+
+
+# --- 5. Stale profile locks: the "app will not open" cause -------------------------
+
+def check_stale_locks(procs, _mem):
+    live = {p.pid for p in procs}
+    out = []
+    base = HOME / "Library" / "Application Support"
+    try:
+        candidates = list(base.glob("*/SingletonLock")) + list(base.glob("*/*/SingletonLock"))
+    except OSError:
+        return out
+    for lock in candidates:
+        try:
+            target = os.readlink(lock)
+        except OSError:
+            continue
+        m = re.search(r"-(\d+)$", target)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid in live:
+            continue
+        app = lock.parent.name
+        siblings = [lock.parent / n for n in ("SingletonLock", "SingletonCookie", "SingletonSocket")]
+
+        def _clear(lang, paths=siblings, name=app):
+            n = 0
+            for path in paths:
+                try:
+                    path.unlink()
+                    n += 1
+                except OSError:
+                    pass
+            return t(lang, "res.cleared", n=n, app=name)
+
+        out.append(Finding(
+            "warn", f"lock:{app}", CAT_BROWSER, "lock.t", "lock.d",
+            {"app": app, "pid": pid},
+            fix=_clear, fix_key="fix.clearlock", fix_params={"app": app},
+            evidence=[str(lock)],
+        ))
+    return out
+
+
+# --- 6. Idle heavyweights -----------------------------------------------------------
+
+def check_idle_heavy(procs, _mem):
+    out = []
+    me = getpass.getuser()
+    # Only Docker Desktop itself counts. `com.docker.vmnetd` lives in
+    # /Library/PrivilegedHelperTools, is a root launchd service, and runs whether or not
+    # Docker Desktop is open — matching on "com.docker" therefore reported Docker as
+    # running when it was not, and offered a Quit button that could never do anything,
+    # so the finding survived every click. Anything under /Library is not the app.
+    docker = [p for p in procs
+              if ("/Applications/Docker.app/" in p.cmd or "Docker Desktop.app" in p.cmd)
+              and "/Library/PrivilegedHelperTools" not in p.cmd]
+    if docker:
+        try:
+            running = len(subprocess.run(["docker", "ps", "-q"], capture_output=True,
+                                         text=True, timeout=8).stdout.split())
+        except Exception:
+            running = -1
+        if running == 0:
+            # The Virtualization VM is deliberately not added in: on this Mac one has
+            # been up since boot with no relationship to Docker, and blaming it here
+            # would inflate the number we ask the user to trust.
+            cost = sum(p.rss for p in docker)
+
+            def _quit(lang):
+                subprocess.run(["osascript", "-e", 'quit app "Docker Desktop"'],
+                               capture_output=True)
+                # Quitting is asynchronous. Report what actually happened rather than
+                # what was requested — a fix that always claims success is how a button
+                # ends up looking broken.
+                for _ in range(16):
+                    time.sleep(0.5)
+                    still = subprocess.run(["pgrep", "-f", "/Applications/Docker.app/"],
+                                           capture_output=True, text=True).stdout.split()
+                    if not still:
+                        return t(lang, "res.dockerquit")
+                return t(lang, "res.dockerstuck")
+
+            out.append(Finding(
+                "warn", "docker", CAT_CONTAINER, "docker.t", "docker.d",
+                {"size": mb(cost)}, cost_kb=cost,
+                fix=_quit, fix_key="fix.quitdocker",
+            ))
+
+    sims = [p for p in procs if "CoreSimulator" in p.cmd and p.user == me and p.rss > 100 * 1024]
+    if sims:
+        cost = sum(p.rss for p in sims)
+        out.append(Finding("info", "simulator", CAT_CONTAINER, "sim.t", "sim.d",
+                           {"n": len(sims), "size": mb(cost)}, cost_kb=cost))
+    return out
+
+
+# --- 7. Memory pressure verdict ------------------------------------------------------
+
+def check_memory(_procs, mem):
+    out = []
+    swap_pct = (mem["swap_used_mb"] / mem["swap_total_mb"] * 100) if mem["swap_total_mb"] else 0
+    if swap_pct > 80:
+        out.append(Finding(
+            "critical" if swap_pct > 92 else "warn", "swap", CAT_MEMORY,
+            "swap.t", "swap.d",
+            {"pct": f"{swap_pct:.0f}", "used": f"{mem['swap_used_mb'] / 1024:.1f}",
+             "total": f"{mem['swap_total_mb'] / 1024:.1f}",
+             "days": f"{mem['uptime_days']:.0f}"},
+        ))
+    if mem["free_pct"] and mem["free_pct"] < 25:
+        out.append(Finding("critical", "pressure", CAT_MEMORY, "pressure.t", "pressure.d",
+                           {"pct": mem["free_pct"]}))
+    if mem["uptime_days"] > 10 and swap_pct > 60:
+        out.append(Finding("info", "uptime", CAT_MEMORY, "uptime.t", "uptime.d",
+                           {"days": f"{mem['uptime_days']:.0f}"}))
+    return out
+
+
+# --- 8. Process swarms ----------------------------------------------------------------
+
+def check_swarms(procs, _mem):
+    me = getpass.getuser()
+    groups = {}
+    for p in procs:
+        if p.user != me or PROTECTED.search(p.cmd):
+            continue
+        groups.setdefault(p.exe, []).append(p)
+    out = []
+    for exe, members in groups.items():
+        cost = sum(p.rss for p in members)
+        if len(members) < 12 or cost < 700 * 1024:
+            continue
+        out.append(Finding("info", f"swarm:{exe}", CAT_PROC, "swarm.t", "swarm.d",
+                           {"n": len(members), "name": exe.rsplit("/", 1)[-1],
+                            "size": mb(cost)}, cost_kb=cost))
+    return sorted(out, key=lambda f: -f.cost_kb)[:3]
+
+
+CHECKS = [check_cpu_burners, check_ghosts, check_ai_toolchain, check_headless_browsers,
+          check_stale_locks, check_idle_heavy, check_memory, check_swarms]
+
+
+def run_checks(procs=None, mem=None, apply_mutes=True):
+    procs = procs if procs is not None else processes()
+    mem = mem if mem is not None else memory()
+    found = []
+    for check in CHECKS:
+        try:
+            found.extend(check(procs, mem))
+        except Exception as exc:          # one bad check must not kill the scan
+            print(f"{S.D}(check {check.__name__} failed: {exc}){S.R}", file=sys.stderr)
+    if apply_mutes:
+        silenced = hist.muted_keys()
+        found = [f for f in found if f.key not in silenced]
+    # Nested message keys (the "where" of a ghost, the "verdict" of an MCP server) are
+    # resolved late so they follow the render language like everything else.
+    return found
+
+
+def resolve_nested(f, lang):
+    p = dict(f.params)
+    if "where_key" in p:
+        p["where"] = t(lang, p.pop("where_key"))
+    if "verdict_key" in p:
+        p["verdict"] = t(lang, p.pop("verdict_key"), **p.pop("verdict_params", {}))
+    return p
+
+
+def rendered(f, lang):
+    p = resolve_nested(f, lang)
+    return t(lang, f.title_key, **p), t(lang, f.detail_key, **p)
+
+
+# ------------------------------------------------------------------------- scoring
+
+def score(findings, mem):
+    s = 100
+    for f in findings:
+        s -= {"critical": 18, "warn": 8, "info": 0}[f.sev]
+    if mem["free_pct"]:
+        s -= max(0, (30 - mem["free_pct"])) // 2
+    return max(0, min(100, s))
+
+
+def grade_key(n):
+    return "grade.healthy" if n >= 85 else ("grade.attention" if n >= 65 else "grade.struggling")
+
+
+def grade_colour(n):
+    return S.GRN if n >= 85 else (S.YEL if n >= 65 else S.RED)
+
+
+# ------------------------------------------------------------------- presentation
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def render_terminal(findings, mem, points, lang):
+    colour = grade_colour(points)
+    bar_w = 34
+    filled = round(points / 100 * bar_w)
+    print()
+    print(f"  {S.B}macpulse{S.R} {S.D}v{VERSION}{S.R}   {S.D}{t(lang, 'app.tagline')}{S.R}")
+    print(f"  {hr()}")
+    print(f"  {colour}{S.B}{points}/100 — {t(lang, grade_key(points))}{S.R}   "
+          f"{colour}{'█' * filled}{S.D}{'░' * (bar_w - filled)}{S.R}")
+    print()
+    print(f"  {S.D}RAM {mem['total'] / GB:.0f} GB · {t(lang, 'ui.free')} {mem['free_pct']}% · "
+          f"{t(lang, 'ui.swap')} {mem['swap_used_mb'] / 1024:.1f}/"
+          f"{mem['swap_total_mb'] / 1024:.1f} GB · "
+          f"{t(lang, 'ui.uptime')} {mem['uptime_days']:.0f} {t(lang, 'ui.days')}{S.R}")
+    print()
+
+    if not findings:
+        print(f"  {S.GRN}{t(lang, 'ui.allgood')}{S.R}\n")
+        return
+
+    # Only what pressing Fix would really free — same rule as the app.
+    reclaim = sum(f.cost_kb for f in findings if f.fix)
+    hours = sum(f.core_hours for f in findings)
+    head = []
+    if reclaim:
+        head.append(f"{S.B}{mb(reclaim)}{S.R} {t(lang, 'ui.recoverable').lower()}")
+    if hours >= 1:
+        head.append(f"{S.B}{t(lang, 'ui.corehours', n=f'{hours:.0f}')}{S.R}")
+    if head:
+        print(f"  {' · '.join(head)}\n")
+
+    icons = {"critical": (S.RED, "●"), "warn": (S.YEL, "●"), "info": (S.CYA, "○")}
+    for order in ("critical", "warn", "info"):
+        for f in [x for x in findings if x.sev == order]:
+            c, dot = icons[f.sev]
+            title, detail = rendered(f, lang)
+            print(f"  {c}{dot}{S.R} {S.B}{title}{S.R}")
+            for line in _wrap(detail, 72):
+                print(f"    {S.D}{line}{S.R}")
+            for e in f.evidence[:4]:
+                print(f"    {S.D}· {e[:70]}{S.R}")
+            if f.fix:
+                print(f"    {S.MAG}→ {f.fix_label(lang)}{S.R}")
+            print()
+
+    fixable = [f for f in findings if f.fix]
+    if fixable:
+        print(f"  {hr()}")
+        print(f"  {S.B}{len(fixable)}/{len(findings)}{S.R} → macpulse --fix\n")
+
+
+def render_html(findings, mem, points, path, lang):
+    sev_order = {"critical": 0, "warn": 1, "info": 2}
+    rows = []
+    for f in sorted(findings, key=lambda x: sev_order[x.sev]):
+        title, detail = rendered(f, lang)
+        ev = "".join(f"<li>{html.escape(e[:180])}</li>" for e in f.evidence[:5])
+        chips = []
+        if f.cost_kb:
+            chips.append(f"<span class='tag'>{mb(f.cost_kb)}</span>")
+        if f.core_hours >= 1:
+            chips.append(f"<span class='tag'>{t(lang, 'ui.corehours', n=f'{f.core_hours:.0f}')}</span>")
+        if f.fix:
+            chips.append(f"<span class='tag fix'>{html.escape(f.fix_label(lang))}</span>")
+        rows.append(f"""
+        <article class="f {f.sev}">
+          <header><span class="dot"></span><h3>{html.escape(title)}</h3></header>
+          <p>{html.escape(detail)}</p>
+          {"<ul class='ev'>" + ev + "</ul>" if ev else ""}
+          <div class="tags">{"".join(chips)}</div>
+        </article>""")
+
+    # Only what pressing Fix would really free — same rule as the app.
+    reclaim = sum(f.cost_kb for f in findings if f.fix)
+    colour = "#30d158" if points >= 85 else "#ff9f0a" if points >= 65 else "#ff453a"
+    doc = f"""<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>macpulse</title><style>
+*{{box-sizing:border-box}}
+body{{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+background:#fbfbfd;color:#1d1d1f;padding:40px 20px}}
+.wrap{{max-width:760px;margin:0 auto}}
+h1{{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}}
+.sub{{color:#86868b;margin:0 0 28px;font-size:14px}}
+.score{{display:flex;align-items:baseline;gap:14px}}
+.score b{{font-size:52px;letter-spacing:-.03em;line-height:1;color:{colour}}}
+.bar{{height:8px;border-radius:99px;background:#e8e8ed;overflow:hidden;margin:14px 0 6px}}
+.bar i{{display:block;height:100%;width:{points}%;background:{colour}}}
+.meta{{color:#86868b;font-size:13px;margin-bottom:30px}}
+.f{{background:#fff;border:1px solid #e8e8ed;border-radius:14px;padding:18px 20px;margin-bottom:14px}}
+.f header{{display:flex;align-items:center;gap:9px;margin-bottom:8px}}
+.f h3{{font-size:16px;margin:0;font-weight:600}}
+.dot{{width:9px;height:9px;border-radius:99px;flex:none}}
+.critical .dot{{background:#ff453a}} .warn .dot{{background:#ff9f0a}} .info .dot{{background:#0a84ff}}
+.f p{{margin:0;color:#424245;font-size:14px}}
+.ev{{margin:11px 0 0;padding-left:16px;color:#86868b;font-size:12px;
+font-family:ui-monospace,Menlo,monospace;word-break:break-all}}
+.tags{{margin-top:11px;display:flex;gap:7px;flex-wrap:wrap}}
+.tag{{font-size:11.5px;padding:3px 9px;border-radius:99px;background:#f2f2f7;color:#6e6e73}}
+.tag.fix{{background:#e8f5e9;color:#1b5e20}}
+@media (prefers-color-scheme:dark){{
+body{{background:#000;color:#f5f5f7}} .f{{background:#1c1c1e;border-color:#2c2c2e}}
+.f p{{color:#aeaeb2}} .bar{{background:#2c2c2e}} .tag{{background:#2c2c2e;color:#aeaeb2}}
+.tag.fix{{background:#0f3d1a;color:#7ee39a}}}}
+</style></head><body><div class="wrap">
+<h1>macpulse</h1><p class="sub">{html.escape(t(lang, 'app.tagline'))} · {time.strftime('%d.%m.%Y %H:%M')}</p>
+<div class="score"><b>{points}</b><span>/100 — {html.escape(t(lang, grade_key(points)))}</span></div>
+<div class="bar"><i></i></div>
+<p class="meta">{mem['total'] / GB:.0f} GB RAM · {mem['free_pct']}% ·
+{mem['swap_used_mb'] / 1024:.1f}/{mem['swap_total_mb'] / 1024:.1f} GB ·
+{mem['uptime_days']:.0f} {html.escape(t(lang, 'ui.days'))}
+{f" · <b>{mb(reclaim)}</b>" if reclaim else ""}</p>
+{"".join(rows) or f"<p>{html.escape(t(lang, 'ui.allgood'))}</p>"}
+</div></body></html>"""
+    pathlib.Path(path).write_text(doc)
+    return path
+
+
+# ------------------------------------------------------------------------- fixing
+
+def apply_fixes(findings, assume_yes, lang):
+    fixable = [f for f in findings if f.fix]
+    if not fixable:
+        print(f"  {S.GRN}{t(lang, 'ui.nofix')}{S.R}\n")
+        return
+    done = 0
+    for f in fixable:
+        print(f"  {S.B}{rendered(f, lang)[0]}{S.R}")
+        print(f"    {S.MAG}{f.fix_label(lang)}{S.R}")
+        if not assume_yes:
+            try:
+                ans = input("    [y/N/q] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if ans == "q":
+                break
+            if ans != "y":
+                print(f"    {S.D}—{S.R}\n")
+                continue
+        try:
+            print(f"    {S.GRN}✓ {f.fix(lang)}{S.R}\n")
+            done += 1
+        except Exception as exc:              # a fix must never crash the run
+            print(f"    {S.RED}✗ {exc}{S.R}\n")
+    print(f"  {S.B}{t(lang, 'ui.applied', done=done, total=len(fixable))}{S.R}\n")
+
+
+# ------------------------------------------------------------------------ the app
+
+APP_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>macpulse</title>
+<style>
+:root{
+  --bg:#ECECEE; --side:#E3E3E6; --card:#FFFFFF; --ink:#1D1D1F; --soft:#6E6E73;
+  --faint:#6C6C70; --sep:#E0E0E3; --sel:#00857F; --selfg:#FFFFFF;
+  --crit:#D0342C; --warn:#B0710A; --ok:#1E8E4E; --tint:#00857F;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#1E1E20; --side:#232326; --card:#2C2C2E; --ink:#F2F2F7; --soft:#A1A1A6;
+  --faint:#A6A6AC; --sep:#3A3A3C; --sel:#2AA79F; --selfg:#0B1E1D;
+  --crit:#FF6961; --warn:#E8A33D; --ok:#4FD182; --tint:#35D6C8;}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:13px;-webkit-font-smoothing:antialiased;overflow:hidden}
+.shell{display:grid;grid-template-columns:216px 1fr;height:100vh}
+
+/* ---------------- sidebar ---------------- */
+.side{background:var(--side);border-right:1px solid var(--sep);
+  display:flex;flex-direction:column;padding:14px 10px 10px}
+.idbox{display:flex;align-items:center;gap:10px;padding:4px 8px 14px}
+.glyph{width:34px;height:34px;border-radius:8px;background:#0B1B21;flex:none;
+  display:grid;place-items:center;overflow:hidden}
+.glyph svg{display:block}
+.idbox b{display:block;font-size:13.5px;font-weight:600;letter-spacing:-.01em}
+.idbox span{display:block;font-size:11px;color:var(--faint);margin-top:1px}
+nav{display:flex;flex-direction:column;gap:1px;flex:1;overflow-y:auto}
+nav button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+  font:inherit;font-size:13px;border:0;background:none;color:var(--ink);
+  padding:6px 9px;border-radius:6px;cursor:pointer}
+nav button:hover{background:rgba(127,127,127,.12)}
+nav button[aria-current="true"]{background:var(--sel);color:var(--selfg)}
+nav button[aria-current="true"] .cnt{background:rgba(255,255,255,.25);color:var(--selfg)}
+nav .ico{width:17px;height:17px;flex:none;opacity:.85}
+nav .lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cnt{font-size:11px;font-family:var(--mono);background:rgba(127,127,127,.18);
+  color:var(--soft);border-radius:20px;padding:1px 6px;min-width:19px;text-align:center}
+.sidefoot{padding:10px 8px 2px;border-top:1px solid var(--sep);margin-top:8px;
+  display:flex;flex-direction:column;gap:8px}
+.langs{display:flex;gap:4px}
+.langs button{flex:1;font:inherit;font-size:11.5px;padding:4px 0;border-radius:5px;
+  border:1px solid var(--sep);background:var(--card);color:var(--soft);cursor:pointer;
+  text-transform:uppercase;letter-spacing:.06em}
+.langs button[aria-pressed="true"]{background:var(--sel);color:var(--selfg);border-color:var(--sel)}
+.sidefoot small{font-size:10.5px;color:var(--faint);font-family:var(--mono)}
+
+/* ---------------- main ---------------- */
+.main{overflow-y:auto;overflow-x:hidden;padding:0;min-width:0}
+.bar{position:sticky;top:0;z-index:5;background:var(--bg);
+  display:flex;align-items:center;gap:9px;padding:14px 26px 10px}
+.bar h1{font-size:20px;font-weight:640;letter-spacing:-.02em;margin:0;flex:1;min-width:0}
+.bar button{font:inherit;font-size:12.5px;font-weight:520;padding:5px 13px;border-radius:6px;
+  border:1px solid var(--sep);background:var(--card);color:var(--ink);cursor:pointer}
+.bar button:hover:not(:disabled){border-color:var(--sel)}
+.bar button.primary{background:var(--sel);border-color:var(--sel);color:var(--selfg)}
+.bar button:disabled{opacity:.4;cursor:default}
+button:focus-visible,nav button:focus-visible{outline:2px solid var(--tint);outline-offset:2px}
+.pane{padding:2px 26px 40px;max-width:720px;min-width:0}
+
+.grouphead{font-size:11.5px;color:var(--faint);margin:20px 0 6px 12px;
+  letter-spacing:.02em;font-weight:500}
+.group{background:var(--card);border-radius:10px;overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;padding:9px 14px;min-height:42px;
+  border-top:1px solid var(--sep)}
+.row:first-child{border-top:0}
+/* multi-line findings read better with the marker and the action pinned to the top */
+.row:has(.sev){align-items:flex-start}
+.row:has(.sev) .sev{margin-top:6px}
+.row:has(.sev) .act{margin-top:1px}
+.row .txt{flex:1;min-width:0;overflow-wrap:anywhere}
+.row .txt b{display:block;font-size:13px;font-weight:500;letter-spacing:-.005em}
+.row .txt span{display:block;font-size:11.5px;color:var(--soft);margin-top:2px;line-height:1.45}
+.row .val{font-size:13px;color:var(--soft);font-family:var(--mono);
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.row .act{font:inherit;font-size:12px;font-weight:520;padding:4px 11px;border-radius:6px;
+  border:1px solid var(--sel);background:transparent;color:var(--sel);cursor:pointer;white-space:nowrap}
+.row .act:hover:not(:disabled){background:var(--sel);color:var(--selfg)}
+.row .act:disabled{opacity:.45;cursor:default}
+.sev{width:8px;height:8px;border-radius:99px;flex:none;border:1.5px solid transparent}
+.sevtxt{font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;
+  font-weight:600;margin-right:6px}
+.sevtxt.critical{color:var(--crit)} .sevtxt.warn{color:var(--warn)}
+.sevtxt.info{color:var(--soft)}
+.sev.critical{background:var(--crit)}
+.sev.warn{background:var(--warn);border-radius:2px}
+.sev.info{background:transparent;border-color:var(--faint)}
+
+/* status header row, like the account row in System Settings */
+.status{display:flex;align-items:center;gap:14px;background:var(--card);
+  border-radius:10px;padding:15px 16px}
+.status .dial{width:52px;height:52px;flex:none;position:relative}
+.status .dial .n{position:absolute;inset:0;display:grid;place-items:center;
+  font-family:var(--mono);font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.status .who{min-width:0;overflow-wrap:anywhere}
+.status .who b{font-size:15px;font-weight:600;letter-spacing:-.01em;display:block}
+.status .who span{font-size:12px;color:var(--soft);display:block;margin-top:2px}
+.ev{margin:6px 0 0;padding:0;list-style:none;font-family:var(--mono);font-size:11.5px;
+  color:var(--soft);word-break:break-all;display:flex;flex-direction:column;gap:1px}
+.empty{padding:34px 16px;text-align:center;color:var(--soft);font-size:13px}
+.empty b{display:block;color:var(--ok);font-size:14px;margin-bottom:4px}
+#toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,80px);
+  background:rgba(28,28,30,.96);color:#fff;padding:9px 18px;border-radius:8px;
+  font-size:12.5px;box-shadow:0 6px 22px rgba(0,0,0,.3);transition:transform .22s;
+  max-width:80vw;z-index:20}
+#toast.show{transform:translate(-50%,0)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* Narrow windows: the sidebar becomes a horizontal strip rather than disappearing.
+   Hiding it outright (the first version did) took every pane except Overview and the
+   language switcher with it — the app silently lost most of its features and all of
+   its multilingual-ness at exactly the size where a user is least able to work around
+   it. Nothing here is allowed to make the body scroll sideways either. */
+.shell>*{min-width:0}
+@media (max-width:720px){
+  .shell{grid-template-columns:1fr;grid-template-rows:auto 1fr}
+  .side{flex-direction:row;align-items:center;gap:8px;overflow-x:auto;overflow-y:hidden;
+    border-right:0;border-bottom:1px solid var(--sep);padding:8px 10px}
+  .idbox{padding:0 4px 0 0;flex:none}
+  .idbox div{display:none}
+  nav{flex-direction:row;flex:none;gap:4px;overflow:visible}
+  nav button{white-space:nowrap;padding:5px 10px}
+  nav .lbl{overflow:visible}
+  .sidefoot{border-top:0;margin:0 0 0 auto;padding:0;flex:none}
+  .sidefoot small{display:none}
+  .langs{gap:3px}
+  .langs button{padding:4px 8px}
+  .bar{flex-wrap:wrap;padding:12px 16px 8px}
+  .bar h1{flex:1 0 100%;margin-bottom:2px}
+  .pane{padding:2px 16px 32px}
+  .row{flex-wrap:wrap}
+  .row .val{white-space:normal;margin-left:auto}
+  .row .act{margin-left:19px;white-space:normal}
+}
+</style></head><body>
+<div class="shell">
+  <aside class="side">
+    <div class="idbox">
+      <span class="glyph"><svg width="26" height="26" viewBox="0 0 100 100" aria-hidden="true">
+        <polyline fill="none" stroke="#35D6C8" stroke-width="7" stroke-linejoin="round"
+          stroke-linecap="round" points="2,56 16,56 24,44 32,68 42,14 52,78 60,50 72,50 98,50"/>
+      </svg></span>
+      <div><b>macpulse</b><span id="tagline">…</span></div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidefoot">
+      <div class="langs" id="langs"></div>
+      <small id="stamp">…</small>
+    </div>
+  </aside>
+  <div class="main">
+    <div class="bar">
+      <h1 id="paneTitle">…</h1>
+      <button id="quit"></button>
+      <button id="rescan"></button>
+      <button id="fixall" class="primary" disabled></button>
+    </div>
+    <div class="pane" id="pane"></div>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+const TOKEN = new URLSearchParams(location.search).get("k") || "";
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let D = null, LANG = localStorage.getItem("macpulse.lang") || "", PANE = "overview", busy = false;
+
+const ICONS = {
+  overview:'<path d="M3 12h4l2-6 3 12 2-7h4"/>',
+  memory:'<rect x="3" y="6" width="14" height="9" rx="2"/><path d="M7 6V3M13 6V3"/>',
+  processes:'<circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/>',
+  ai:'<path d="M6 3h8v6l-4 8-4-8z"/>',
+  browser:'<circle cx="10" cy="10" r="7"/><path d="M3 10h14M10 3a12 12 0 000 14"/>',
+  containers:'<path d="M3 7l7-4 7 4-7 4z"/><path d="M3 13l7 4 7-4"/>'
+};
+const ORDER = ["overview","memory","processes","ai","browser","containers"];
+
+function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");
+  clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),3000);}
+function T(k,d){return (D&&D.strings&&D.strings[k])||d||k;}
+
+function dial(score){
+  const c = score>=85?"var(--ok)":score>=65?"var(--warn)":"var(--crit)";
+  const off = 132 - 132*score/100;
+  return `<div class="dial"><svg width="52" height="52" viewBox="0 0 52 52">
+    <circle cx="26" cy="26" r="21" fill="none" stroke="var(--sep)" stroke-width="5"/>
+    <circle cx="26" cy="26" r="21" fill="none" stroke="${c}" stroke-width="5"
+      stroke-linecap="round" stroke-dasharray="132" stroke-dashoffset="${off}"
+      transform="rotate(-90 26 26)"/></svg>
+    <span class="n" style="color:${c}">${score}</span></div>`;
+}
+
+function findingRow(f){
+  const bits = [];
+  if(f.cost_kb) bits.push((f.cost_kb/1024).toFixed(0)+" MB");
+  if(f.core_hours>=1) bits.push(T("ui.corehours","{n} core-hours").replace("{n}",Math.round(f.core_hours)));
+  const right = f.fixable
+    ? `<button class="act" data-key="${esc(f.key)}">${esc(f.fix_label||T("btn.fix","Fix"))}</button>`
+    : `<span class="val">${esc(bits.join(" · "))}</span>`;
+  const ev = (f.evidence||[]).slice(0,2).map(e=>`<li>${esc(e)}</li>`).join("");
+  // The cost already appears in most titles; repeating it under the text reads as a
+  // stutter, so only show it when the title does not already carry the number.
+  const dupe = bits.some(b => f.title.includes(b));
+  const sevWord = {critical:"!!", warn:"!", info:"i"}[f.severity] || "";
+  return `<div class="row"><span class="sev ${f.severity}" role="img"
+      aria-label="${f.severity}" title="${sevWord}"></span>
+    <div class="txt"><b>${esc(f.title)}</b><span>${esc(f.detail)}</span>
+      ${ev?`<ul class="ev">${ev}</ul>`:""}
+      ${(f.fixable&&bits.length&&!dupe)?`<span>${esc(bits.join(" · "))}</span>`:""}</div>
+    ${right}</div>`;
+}
+
+function paint(){
+  if(!D) return;
+  $("#tagline").textContent = T("app.tagline","");
+  $("#rescan").textContent = T("btn.rescan","Rescan");
+  $("#quit").textContent = T("btn.quit","Quit");
+  $("#stamp").textContent = new Date().toLocaleTimeString()+" · "+D.host;
+
+  const counts = {};
+  ORDER.forEach(k=>counts[k]=0);
+  D.findings.forEach(f=>counts[f.category]=(counts[f.category]||0)+1);
+  $("#nav").innerHTML = ORDER.map(k=>`
+    <button data-pane="${k}" aria-current="${k===PANE}">
+      <svg class="ico" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+        stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>
+      <span class="lbl">${esc(T("nav."+k,k))}</span>
+      ${k!=="overview"&&counts[k]?`<span class="cnt">${counts[k]}</span>`:""}
+    </button>`).join("");
+  document.querySelectorAll("nav button").forEach(b=>
+    b.addEventListener("click",()=>{PANE=b.dataset.pane;paint();}));
+
+  $("#langs").innerHTML = ["az","en","ru"].map(l=>
+    `<button data-lang="${l}" aria-pressed="${l===D.lang}">${l}</button>`).join("");
+  document.querySelectorAll("#langs button").forEach(b=>
+    b.addEventListener("click",()=>{LANG=b.dataset.lang;
+      localStorage.setItem("macpulse.lang",LANG);scan();}));
+
+  $("#paneTitle").textContent = T("nav."+PANE,PANE);
+  const fixable = D.findings.filter(f=>f.fixable);
+  $("#fixall").textContent = fixable.length
+    ? T("btn.fixall.n","Fix all ({n})").replace("{n}",fixable.length)
+    : T("btn.fixall","Fix all safe");
+  $("#fixall").disabled = !fixable.length || busy;
+
+  let h = "";
+  if(PANE==="overview"){
+    const m = D.memory;
+    h += `<div class="status">${dial(D.score)}<div class="who">
+      <b>${esc(D.grade)}</b><span>${esc(T("ui.readonly",""))}</span></div></div>`;
+    h += `<p class="grouphead">${esc(T("ui.vitals","Vitals"))}</p><div class="group">`;
+    h += [[T("ui.free","Memory free"), m.free_pct+"%"],
+          [T("ui.swap","Swap"), (m.swap_used_mb/1024).toFixed(1)+" / "+(m.swap_total_mb/1024).toFixed(1)+" GB"],
+          [T("ui.uptime","Uptime"), Math.round(m.uptime_days)+" "+T("ui.days","days")],
+          [T("ui.recoverable","Recoverable"), (D.recoverable_kb/1048576).toFixed(2)+" GB"]]
+      .map(([k,v])=>`<div class="row"><div class="txt"><b>${esc(k)}</b></div>
+        <span class="val">${esc(v)}</span></div>`).join("");
+    h += `</div>`;
+    const top = D.findings.filter(f=>f.severity!=="info").slice(0,4);
+    h += `<p class="grouphead">${esc(T("ui.findings","Findings"))} (${D.findings.length})</p>`;
+    h += top.length ? `<div class="group">${top.map(findingRow).join("")}</div>`
+      : `<div class="group"><div class="empty"><b>${esc(T("ui.nofindings",""))}</b>
+         ${esc(T("ui.allgood",""))}</div></div>`;
+  } else {
+    const list = D.findings.filter(f=>f.category===PANE);
+    h += list.length ? `<p class="grouphead">${esc(T("ui.findings","Findings"))} (${list.length})</p>
+      <div class="group">${list.map(findingRow).join("")}</div>`
+      : `<div class="group"><div class="empty">${esc(T("ui.nothing.section",""))}</div></div>`;
+  }
+  $("#pane").innerHTML = h;
+  document.querySelectorAll("button.act").forEach(b=>
+    b.addEventListener("click",()=>runFix(b.dataset.key,b)));
+}
+
+async function scan(){
+  $("#rescan").disabled = true;
+  try{
+    const q = "/api/scan?k="+encodeURIComponent(TOKEN)+(LANG?"&lang="+LANG:"");
+    const r = await fetch(q);
+    if(!r.ok) throw new Error(r.status);
+    D = await r.json();
+    if(!LANG) LANG = D.lang;
+    document.documentElement.lang = D.lang;
+    paint();
+  }catch(e){ toast(T("ui.scanfail","Scan failed: {err}").replace("{err}",e.message)); }
+  finally{ $("#rescan").disabled = false; }
+}
+
+async function runFix(key,btn){
+  if(busy) return;
+  busy = true;
+  if(btn){btn.disabled=true;btn.textContent=T("btn.working","Working…");}
+  try{
+    const r = await fetch("/api/fix?k="+encodeURIComponent(TOKEN)+(LANG?"&lang="+LANG:""),
+      {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key})});
+    const j = await r.json();
+    toast(j.ok ? j.result : T("ui.failed","Could not apply: {err}").replace("{err}",j.error||"?"));
+  }catch(e){ toast(T("ui.failed","Could not apply: {err}").replace("{err}",e.message)); }
+  finally{ busy=false; await scan(); }
+}
+
+$("#rescan").addEventListener("click",scan);
+$("#fixall").addEventListener("click",async()=>{
+  const list = D.findings.filter(f=>f.fixable);
+  const summary = list.map(f=>"• "+f.fix_label).join("\n");
+  if(!confirm(T("ui.confirm","Apply these fixes?")+"\n\n"+summary)) return;
+  const keys = list.map(f=>f.key);
+  $("#fixall").disabled = true; $("#fixall").textContent = T("btn.working","Working…");
+  let n = 0;
+  for(const k of keys){
+    try{
+      const r = await fetch("/api/fix?k="+encodeURIComponent(TOKEN)+(LANG?"&lang="+LANG:""),
+        {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});
+      if((await r.json()).ok) n++;
+    }catch(e){ /* keep going; the rescan below reports the real state */ }
+  }
+  toast(T("ui.applied","{done}/{total}").replace("{done}",n).replace("{total}",keys.length));
+  await scan();
+});
+$("#quit").addEventListener("click",async()=>{
+  $("#quit").disabled = true;
+  try{ await fetch("/api/quit?k="+encodeURIComponent(TOKEN),{method:"POST"}); }
+  catch(e){ /* the server dropping the connection as it stops is the success case */ }
+  document.body.innerHTML='<div style="display:grid;place-items:center;height:100vh;'+
+    'text-align:center;font-family:var(--sans);color:var(--soft)"><div>'+
+    '<p style="font-size:15px;color:var(--ink);margin:0 0 5px">'+T("ui.stopped","Stopped.")+'</p>'+
+    '<p style="margin:0;font-size:12.5px">'+T("ui.closetab","")+'</p></div></div>';
+});
+scan();
+</script></body></html>"""
+
+
+def serve_ui(port, default_lang):
+    """Serve the app on loopback only, gated by a token minted at startup.
+
+    This service can terminate processes. A bare localhost port would let any page
+    the user happens to have open drive it, so every API call must carry the token,
+    and the token only ever reaches the browser through the URL we open ourselves.
+    """
+    import http.server
+    import secrets
+    import socket
+    import threading
+    import urllib.parse
+
+    token = secrets.token_urlsafe(18)
+    state = {"findings": [], "seen": time.time()}
+
+    def scan_payload(lang):
+        mem = memory()
+        found = run_checks(processes(), mem)
+        state["findings"] = found
+        points = score(found, mem)
+        items = []
+        for f in found:
+            title, detail = rendered(f, lang)
+            items.append({"severity": f.sev, "key": f.key, "category": f.category,
+                          "title": title, "detail": detail, "cost_kb": f.cost_kb,
+                          "core_hours": round(f.core_hours, 1), "fixable": bool(f.fix),
+                          "fix_label": f.fix_label(lang), "evidence": f.evidence[:3]})
+        # "Recoverable" must mean what pressing Fix would actually give back. Summing
+        # every finding's cost inflates it with things we only report — 26 Chrome
+        # renderers are 1.5 GB and entirely normal, and counting them would be the
+        # same overclaim the disk cleaners make.
+        return {"version": VERSION, "lang": lang, "strings": bundle(lang),
+                "host": socket.gethostname().replace(".local", ""),
+                "score": points, "grade": t(lang, grade_key(points)), "memory": mem,
+                "recoverable_kb": sum(f.cost_kb for f in found if f.fix),
+                "findings": items}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):            # keep the terminal clean
+            pass
+
+        def _query(self):
+            return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+        def _authorised(self):
+            return secrets.compare_digest((self._query().get("k") or [""])[0], token)
+
+        def _lang(self):
+            want = (self._query().get("lang") or [""])[0]
+            return want if want in LANGS else default_lang
+
+        def _send(self, code, body, ctype="application/json"):
+            payload = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            state["seen"] = time.time()
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/":
+                return self._send(200, APP_HTML, "text/html; charset=utf-8")
+            if path == "/api/scan":
+                if not self._authorised():
+                    return self._send(403, '{"error":"bad token"}')
+                return self._send(200, json.dumps(scan_payload(self._lang())))
+            self._send(404, '{"error":"not found"}')
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path not in ("/api/fix", "/api/quit"):
+                return self._send(404, '{"error":"not found"}')
+            if not self._authorised():
+                return self._send(403, '{"error":"bad token"}')
+            if path == "/api/quit":
+                # Launched from the .app there is no Dock icon and no terminal to
+                # Ctrl-C, so the page must be able to stop the server it talks to.
+                self._send(200, '{"ok":true}')
+                threading.Thread(target=srv.shutdown, daemon=True).start()
+                return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                key = json.loads(self.rfile.read(n) or b"{}").get("key")
+            except (ValueError, TypeError):
+                return self._send(400, '{"error":"bad request"}')
+            target = next((f for f in state["findings"] if f.key == key and f.fix), None)
+            if not target:
+                return self._send(404, '{"error":"stale — rescan first"}')
+            try:
+                return self._send(200, json.dumps({"ok": True, "result": target.fix(self._lang())}))
+            except Exception as exc:
+                return self._send(200, json.dumps({"ok": False, "error": str(exc)}))
+
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        # The app bundle asks for a fixed port so the URL is predictable; if a previous
+        # instance still holds it, fall back to any free port rather than not starting.
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+    if port:
+        def reaper():
+            while True:
+                time.sleep(60)
+                if time.time() - state["seen"] > 1800:
+                    srv.shutdown()
+                    return
+        threading.Thread(target=reaper, daemon=True).start()
+
+    url = f"http://127.0.0.1:{srv.server_address[1]}/?k={token}"
+    print(f"\n  {S.B}macpulse{S.R} → {S.CYA}{url}{S.R}", flush=True)
+    print(f"  {S.D}loopback only · Ctrl-C to quit{S.R}\n", flush=True)
+    webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ui", action="store_true", help="open the app window")
+    ap.add_argument("--port", type=int, default=0, help="with --ui, a fixed port")
+    ap.add_argument("--fix", action="store_true", help="offer to apply each fix")
+    ap.add_argument("--yes", "-y", action="store_true", help="with --fix, do not ask")
+    ap.add_argument("--report", action="store_true", help="write an HTML report and open it")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--lang", choices=LANGS, help="force a language (default: system)")
+    ap.add_argument("--version", action="version", version=f"macpulse {VERSION}")
+    args = ap.parse_args()
+
+    if sys.platform != "darwin":
+        print("macpulse only runs on macOS.")
+        return 2
+
+    lang = args.lang or detect_lang()
+
+    if args.ui:
+        serve_ui(args.port, lang)
+        return 0
+
+    mem = memory()
+    findings = run_checks(processes(), mem)
+    points = score(findings, mem)
+    ages = hist.record(points, mem, findings)
+
+    if args.json:
+        items = []
+        for f in findings:
+            title, detail = rendered(f, lang)
+            age = ages.get(f.key, {})
+            first = age.get("first_seen")
+            items.append({"severity": f.sev, "key": f.key, "category": f.category,
+                          "title": title, "detail": detail, "cost_kb": f.cost_kb,
+                          "core_hours": round(f.core_hours, 1),
+                          "age_days": round((time.time() - first) / 86400, 2) if first else 0,
+                          "seen_times": age.get("times", 1),
+                          "fixable": bool(f.fix), "evidence": f.evidence})
+        print(json.dumps({"version": VERSION, "lang": lang, "score": points,
+                          "grade": t(lang, grade_key(points)), "memory": mem,
+                          "strings": bundle(lang), "trend": hist.trend(),
+                          "findings": items}, indent=2, ensure_ascii=False))
+        return 0
+
+    render_terminal(findings, mem, points, lang)
+
+    if args.report:
+        out = HOME / "Desktop" / "macpulse-report.html"
+        render_html(findings, mem, points, out, lang)
+        print(f"  {S.CYA}{out}{S.R}\n")
+        webbrowser.open(f"file://{out}")
+
+    if args.fix:
+        apply_fixes(findings, args.yes, lang)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

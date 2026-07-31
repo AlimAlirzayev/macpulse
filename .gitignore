@@ -1,0 +1,4 @@
+# Built on the user's machine at install time, never shipped.
+macpulse-menubar
+__pycache__/
+*.pyc
