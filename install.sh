@@ -93,8 +93,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>macpulse</string>
   <key>CFBundleDisplayName</key><string>macpulse</string>
   <key>CFBundleIdentifier</key><string>io.macpulse.app</string>
-  <key>CFBundleVersion</key><string>1.1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.1.0</string>
+  <key>CFBundleVersion</key><string>1.2.0</string>
+  <key>CFBundleShortVersionString</key><string>1.2.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>macpulse</string>
   <key>CFBundleIconFile</key><string>macpulse</string>

@@ -15,16 +15,41 @@
 //   clang -fobjc-arc -O2 -framework AppKit -o macpulse-menubar menubar.m
 
 #import <AppKit/AppKit.h>
+#import <sys/file.h>
+
+// Clicking the app icon a second time must not start a second agent. macOS only
+// enforces one-instance-per-bundle when an app is launched through Launch Services,
+// and this one gets launched every which way — a Desktop alias, `open -a`, the binary
+// directly. An exclusive lock on a file in Application Support holds regardless of how
+// we were started. The second instance does not just die quietly either: it tells the
+// live one to drop its menu open, so a click always produces something visible.
+static NSString *const kShowNotification = @"io.macpulse.agent.show";
+
+static BOOL AcquireSingleInstanceLock(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:
+                     @"Library/Application Support/macpulse"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                             withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSString *lockPath = [dir stringByAppendingPathComponent:@"agent.lock"];
+    int fd = open(lockPath.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return YES;                 // cannot lock: better to run than to refuse
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return NO;
+    }
+    return YES;                             // fd stays open on purpose: it IS the lock
+}
 
 static const NSTimeInterval kRefreshInterval = 15 * 60;
 static const NSInteger kDropThatMatters = 12;   // score drop worth a notification
 
-@interface MPAgent : NSObject
+@interface MPAgent : NSObject <NSApplicationDelegate>
 @property (strong) NSStatusItem *item;
 @property (strong) NSTimer *timer;
 @property (strong) NSDictionary *strings;
 @property (assign) NSInteger lastScore;
 @property (assign) BOOL busy;
+@property (assign) BOOL introduced;
 @end
 
 @implementation MPAgent
@@ -50,6 +75,9 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
     self.item = [[NSStatusBar systemStatusBar]
                  statusItemWithLength:NSVariableStatusItemLength];
     self.item.button.title = @"  –";
+    [[NSDistributedNotificationCenter defaultCenter]
+        addObserver:self selector:@selector(popMenu)
+               name:kShowNotification object:nil];
     [self refresh];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:kRefreshInterval
                                                  target:self
@@ -114,6 +142,11 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
     [self renderTitle:score];
     [self buildMenuWithScore:score grade:grade findings:findings];
 
+    if (!self.introduced) {
+        self.introduced = YES;
+        [self popMenu];             // first launch: show the user where it went
+    }
+
     // Only speak up when the machine got meaningfully worse. A tool that notifies on
     // every scan is muted by the user within a day, and then never heard from again.
     if (self.lastScore >= 0 && (self.lastScore - score) >= kDropThatMatters) {
@@ -171,6 +204,24 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
     self.item.menu = menu;
 }
 
+// Opening the menu is what makes a click feel like it did something. Called on first
+// launch and whenever a second launch attempt is folded into this instance.
+- (void)popMenu {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.item.button performClick:nil];
+    });
+}
+
+// Clicking the icon of an app that is ALREADY running does not start a new process —
+// Launch Services just activates the existing one. For a menu bar app with no windows
+// that looks exactly like nothing happened, which is what the first version did. This
+// is the hook macOS provides for that reopen, and it is the one that actually fires.
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender
+                    hasVisibleWindows:(BOOL)visible {
+    [self popMenu];
+    return NO;
+}
+
 - (void)openPanel {
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
@@ -198,10 +249,17 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
 
 int main(void) {
     @autoreleasepool {
+        if (!AcquireSingleInstanceLock()) {
+            // Already running. Ask that instance to show itself, then step aside.
+            [[NSDistributedNotificationCenter defaultCenter]
+                postNotificationName:kShowNotification object:nil userInfo:nil
+                  deliverImmediately:YES];
+            return 0;
+        }
         NSApplication *app = [NSApplication sharedApplication];
         MPAgent *agent = [MPAgent new];
+        app.delegate = agent;          // must be set before run: reopen arrives via it
         [agent start];
-        (void)app;
         [NSApp run];
     }
     return 0;
