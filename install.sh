@@ -93,8 +93,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>macpulse</string>
   <key>CFBundleDisplayName</key><string>macpulse</string>
   <key>CFBundleIdentifier</key><string>io.macpulse.app</string>
-  <key>CFBundleVersion</key><string>1.2.0</string>
-  <key>CFBundleShortVersionString</key><string>1.2.0</string>
+  <key>CFBundleVersion</key><string>1.3.0</string>
+  <key>CFBundleShortVersionString</key><string>1.3.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>macpulse</string>
   <key>CFBundleIconFile</key><string>macpulse</string>
@@ -203,6 +203,39 @@ rm -rf "$(dirname "$ICONSET")"
 touch "$APP"
 ok "app installed at ~/Applications/macpulse.app"
 
+# ---------------------------------------------------------------- start at login
+# A watcher that stops watching after a restart is not a watcher. The menu bar agent
+# starts at login through a per-user LaunchAgent (no sudo, nothing outside $HOME).
+# KeepAlive is off on purpose: choosing Quit from the menu must stay quit until the
+# next login. The panel-only fallback is not started at login — it would open a
+# browser window every time the Mac boots.
+AGENT_PLIST="$HOME/Library/LaunchAgents/io.macpulse.agent.plist"
+if [ "$MENUBAR_OK" -eq 1 ]; then
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>io.macpulse.agent</string>
+  <key>ProgramArguments</key>
+  <array><string>$APP/Contents/MacOS/macpulse</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)/io.macpulse.agent" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+  # Check rather than assume: a malformed plist, or a background item the user has not
+  # allowed under System Settings > General > Login Items, leaves nothing loaded.
+  if launchctl print "gui/$(id -u)/io.macpulse.agent" >/dev/null 2>&1; then
+    ok "starts at login (menu bar watcher, checks memory and disk every minute)"
+  else
+    say "${c_dim}could not register the login agent — allow macpulse under System Settings > General > Login Items${c_r}"
+  fi
+fi
+
 # ---------------------------------------------------------------- PATH
 SHELLRC="$HOME/.zshrc"; [ -n "${BASH_VERSION:-}" ] && [ ! -f "$SHELLRC" ] && SHELLRC="$HOME/.bash_profile"
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN:"; then
@@ -222,4 +255,4 @@ printf '\n  %sDone.%s Open %smacpulse%s from Launchpad, or run:\n\n' "$c_b" "$c_
 printf '      open -a macpulse          %s# the app%s\n' "$c_dim" "$c_r"
 printf '      macpulse                  %s# terminal report%s\n' "$c_dim" "$c_r"
 printf '      macpulse --lang ru        %s# az · en · ru%s\n\n' "$c_dim" "$c_r"
-printf '  %sUninstall: rm -rf ~/Applications/macpulse.app ~/.local/bin/macpulse*%s\n\n' "$c_dim" "$c_r"
+printf '  %sUninstall: launchctl bootout gui/$(id -u)/io.macpulse.agent; rm -rf ~/Applications/macpulse.app ~/Library/LaunchAgents/io.macpulse.agent.plist ~/.local/bin/macpulse*%s\n\n' "$c_dim" "$c_r"

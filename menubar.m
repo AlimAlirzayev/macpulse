@@ -16,6 +16,8 @@
 
 #import <AppKit/AppKit.h>
 #import <sys/file.h>
+#import <sys/mount.h>
+#import <sys/sysctl.h>
 
 // Clicking the app icon a second time must not start a second agent. macOS only
 // enforces one-instance-per-bundle when an app is launched through Launch Services,
@@ -43,9 +45,56 @@ static BOOL AcquireSingleInstanceLock(void) {
 static const NSTimeInterval kRefreshInterval = 15 * 60;
 static const NSInteger kDropThatMatters = 12;   // score drop worth a notification
 
+// The full scan runs every 15 minutes, which is too slow for the failure that matters
+// most: RAM spills into swap, swap fills the disk, and macOS starts force-quitting apps.
+// On 17 Sep 2026 that happened between two scans. So a sentinel reads two kernel
+// counters every minute — no process spawned, effectively free — and triggers a full
+// scan the moment either crosses a threshold. Thresholds mirror DISK_*_GB and
+// SWAP_*_RATIO in the Python engine; change them together.
+static const NSTimeInterval kSentinelInterval = 60;
+static const double kDiskCriticalGB = 5, kDiskWarnGB = 15;
+static const double kSwapWarnRatio = 0.5, kSwapCriticalRatio = 1.0;
+static const NSTimeInterval kRenotifyAfter = 60 * 60;  // same problem, at most hourly
+
+static NSInteger VitalLevel(void) {
+    struct xsw_usage sw = {0};
+    size_t len = sizeof(sw);
+    sysctlbyname("vm.swapusage", &sw, &len, NULL, 0);
+    uint64_t ram = 0;
+    len = sizeof(ram);
+    sysctlbyname("hw.memsize", &ram, &len, NULL, 0);
+    double freeGB = 1e9;
+    struct statfs fs;
+    if (statfs("/System/Volumes/Data", &fs) == 0) {
+        freeGB = (double)fs.f_bavail * (double)fs.f_bsize / 1073741824.0;
+    }
+    double ratio = ram ? (double)sw.xsu_used / (double)ram : 0;
+    if (freeGB < kDiskCriticalGB || ratio >= kSwapCriticalRatio) return 2;
+    if (freeGB < kDiskWarnGB || ratio >= kSwapWarnRatio) return 1;
+    return 0;
+}
+
+static NSInteger SeverityRank(NSString *sev) {
+    if ([sev isEqualToString:@"critical"]) return 2;
+    if ([sev isEqualToString:@"warn"]) return 1;
+    return 0;
+}
+
+// Memory and disk warnings are worth hearing about while they are still warnings —
+// that is the whole point of seeing them early. Everything else speaks up only once it
+// is critical, so the menu bar stays quiet about things that can wait.
+static BOOL EarlyWarningKey(NSString *key) {
+    return [key isEqualToString:@"disk"] || [key isEqualToString:@"swap"]
+        || [key hasPrefix:@"hog:"] || [key isEqualToString:@"pressure"];
+}
+
 @interface MPAgent : NSObject <NSApplicationDelegate>
 @property (strong) NSStatusItem *item;
 @property (strong) NSTimer *timer;
+@property (strong) NSTimer *sentinelTimer;
+@property (assign) NSInteger lastVitalLevel;
+@property (strong) NSMutableDictionary<NSString *, NSNumber *> *lastRank;
+@property (strong) NSMutableDictionary<NSString *, NSDate *> *notifiedAt;
 @property (strong) NSDictionary *strings;
 @property (assign) NSInteger lastScore;
 @property (assign) BOOL busy;
@@ -72,6 +121,18 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
 - (void)start {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.lastScore = -1;
+    self.lastRank = [NSMutableDictionary new];
+    // Persisted, so quitting and reopening the agent does not repeat an alert the user
+    // saw a minute ago. Entries older than the re-notify window are dropped on load.
+    self.notifiedAt = [NSMutableDictionary new];
+    NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"notifiedAt"];
+    for (NSString *key in saved) {
+        NSDate *when = [saved[key] isKindOfClass:NSDate.class] ? saved[key] : nil;
+        if (when && -[when timeIntervalSinceNow] < kRenotifyAfter) {
+            self.notifiedAt[key] = when;
+            self.lastRank[key] = @1;     // already announced: only an escalation speaks
+        }
+    }
     self.item = [[NSStatusBar systemStatusBar]
                  statusItemWithLength:NSVariableStatusItemLength];
     self.item.button.title = @"  –";
@@ -84,6 +145,22 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
                                                selector:@selector(refresh)
                                                userInfo:nil
                                                 repeats:YES];
+    self.sentinelTimer = [NSTimer scheduledTimerWithTimeInterval:kSentinelInterval
+                                                         target:self
+                                                       selector:@selector(sentinel)
+                                                       userInfo:nil
+                                                        repeats:YES];
+}
+
+- (void)sentinel {
+    NSInteger level = VitalLevel();
+    // Only a change for the worse earns an unscheduled scan. If a scan is already
+    // running, keep the old level so the next tick tries again instead of losing it.
+    if (level > self.lastVitalLevel) {
+        if (self.busy) return;
+        [self refresh];
+    }
+    self.lastVitalLevel = level;
 }
 
 // The menu bar is a glance, not a dashboard: one coloured pulse glyph and a number.
@@ -147,11 +224,35 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
         [self popMenu];             // first launch: show the user where it went
     }
 
-    // Only speak up when the machine got meaningfully worse. A tool that notifies on
-    // every scan is muted by the user within a day, and then never heard from again.
-    if (self.lastScore >= 0 && (self.lastScore - score) >= kDropThatMatters) {
-        [self notify:[NSString stringWithFormat:@"%ld → %ld · %@",
-                      (long)self.lastScore, (long)score, grade]];
+    // Only speak up when something got worse. A tool that notifies on every scan is
+    // muted by the user within a day, and then never heard from again. So: one
+    // notification per problem when it appears or escalates, naming the problem and
+    // what to do about it, and not again for the same problem within the hour.
+    BOOL spoke = NO;
+    NSMutableDictionary *ranks = [NSMutableDictionary new];
+    NSDate *now = [NSDate date];
+    for (NSDictionary *f in findings) {
+        NSString *key = [f[@"key"] isKindOfClass:NSString.class] ? f[@"key"] : nil;
+        if (!key) continue;
+        NSInteger rank = SeverityRank(f[@"severity"]);
+        ranks[key] = @(rank);
+        NSInteger before = [self.lastRank[key] integerValue];
+        NSInteger bar = EarlyWarningKey(key) ? 1 : 2;
+        NSDate *last = self.notifiedAt[key];
+        BOOL fresh = !last || [now timeIntervalSinceDate:last] > kRenotifyAfter;
+        if (rank >= bar && rank > before && fresh) {
+            [self notify:f[@"detail"] ?: @"" subtitle:f[@"title"] ?: @""];
+            self.notifiedAt[key] = now;
+            spoke = YES;
+        }
+    }
+    self.lastRank = ranks;
+    if (spoke) {
+        [[NSUserDefaults standardUserDefaults] setObject:self.notifiedAt forKey:@"notifiedAt"];
+    }
+    if (!spoke && self.lastScore >= 0 && (self.lastScore - score) >= kDropThatMatters) {
+        [self notify:grade subtitle:[NSString stringWithFormat:@"%ld → %ld",
+                                     (long)self.lastScore, (long)score]];
     }
     self.lastScore = score;
 }
@@ -230,13 +331,21 @@ static const NSInteger kDropThatMatters = 12;   // score drop worth a notificati
     [task launchAndReturnError:NULL];
 }
 
-- (void)notify:(NSString *)body {
+- (NSString *)appleScriptString:(NSString *)text {
     // Finding titles routinely contain quotes and apostrophes; an unescaped one turns
     // the AppleScript into a syntax error and the notification silently never appears.
-    NSString *safe = [body stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    NSString *safe = [text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
     safe = [safe stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    // A raw line break inside a quoted AppleScript string is a syntax error too, and
+    // finding text carries process and file names, which may contain one.
+    safe = [safe stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    return [safe stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+}
+
+- (void)notify:(NSString *)body subtitle:(NSString *)subtitle {
     NSString *script = [NSString stringWithFormat:
-        @"display notification \"%@\" with title \"macpulse\"", safe];
+        @"display notification \"%@\" with title \"macpulse\" subtitle \"%@\"",
+        [self appleScriptString:body], [self appleScriptString:subtitle]];
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
     task.arguments = @[@"-e", script];

@@ -28,6 +28,7 @@ STRINGS = {
         "ui.vitals": "Vitals",
         "ui.free": "Memory free",
         "ui.swap": "Swap",
+        "ui.disk": "Disk free",
         "ui.uptime": "Uptime",
         "ui.days": "days",
         "ui.recoverable": "Recoverable",
@@ -95,13 +96,17 @@ STRINGS = {
                     "runs in it. At zero containers that memory buys you nothing.",
         "sim.t": "{n} iOS Simulator process(es) using {size}",
         "sim.d": "Simulators keep running after Xcode is closed.",
-        "swap.t": "Swap is {pct}% full ({used} of {total} GB)",
-        "swap.d": "Swap never shrinks back on its own. After {days} days of uptime the "
-                  "only thing that fully reclaims it is a restart.",
+        "swap.t": "{used} GB of memory has spilled onto disk (this Mac has {ram} GB of RAM)",
+        "swap.d": "Swap this large means the apps you run need more memory than the Mac has, so every switch waits on the disk. It does not shrink on its own: quit the biggest app listed here, or restart — the Mac has been up {days} days.",
         "pressure.t": "Only {pct}% of memory is free",
         "pressure.d": "Below about a quarter free, macOS compresses and swaps aggressively "
                       "and everything feels slow — this is the state that ends in the "
                       "'your system has run out of application memory' dialog.",
+        "disk.t": "Only {free} GB free on disk",
+        "disk.d": "When RAM runs short macOS moves memory to disk ({swap} GB right now). With the disk this full there is nowhere left to put it, and macOS starts force-quitting apps — the 'run out of application memory' dialog. Free space first; the biggest regenerable items are listed.",
+        "hog.t": "{name} is using {size} — {pct}% of this Mac's {ram} GB",
+        "hog.d": "One app holding this much memory pushes everything else into swap. If it did not need this much when it started, quitting and reopening it gives the memory back.",
+        "hog.browser.d": "It is almost always one or two tabs, not the browser itself. Open the browser's Task Manager (Shift+Esc in Chrome), sort by memory and close the top tab. Quitting and reopening also works — tabs come back, the memory is returned.",
         "uptime.t": "Up {days} days with swap under pressure",
         "uptime.d": "Long uptime is not a fault by itself, but combined with saturated "
                     "swap a restart is the cheapest full reset available.",
@@ -129,6 +134,7 @@ STRINGS = {
         "ui.vitals": "Göstəricilər",
         "ui.free": "Boş yaddaş",
         "ui.swap": "Swap",
+        "ui.disk": "Diskdə boş",
         "ui.uptime": "İşləmə müddəti",
         "ui.days": "gün",
         "ui.recoverable": "Geri alına bilər",
@@ -197,13 +203,17 @@ STRINGS = {
                     "heç nə qazandırmır.",
         "sim.t": "{n} iOS Simulator prosesi {size} tutur",
         "sim.d": "Simulyatorlar Xcode bağlandıqdan sonra da işləməyə davam edir.",
-        "swap.t": "Swap {pct}% doludur ({used} / {total} GB)",
-        "swap.d": "Swap öz-özünə kiçilmir. {days} günlük işləmədən sonra onu tam boşaldan "
-                  "yeganə şey yenidən başlatmaqdır.",
+        "swap.t": "Yaddaşın {used} GB-ı diskə daşıb (bu Mac-də {ram} GB RAM var)",
+        "swap.d": "Bu qədər swap o deməkdir ki, açıq proqramlara Mac-in RAM-ından çox yaddaş lazımdır və hər keçid diski gözləyir. Swap öz-özünə azalmır: burada göstərilən ən böyük proqramı bağla, ya da Mac-i yenidən başlat — {days} gündür söndürülməyib.",
         "pressure.t": "Yaddaşın yalnız {pct}%-i boşdur",
         "pressure.d": "Dörddə birdən az boş qalanda macOS aqressiv şəkildə sıxır və swap "
                       "edir, hər şey yavaşlayır — «sistemdə tətbiq yaddaşı qalmadı» "
                       "dialoqu ilə bitən vəziyyət elə budur.",
+        "disk.t": "Diskdə cəmi {free} GB boş yer qalıb",
+        "disk.d": "RAM çatmayanda macOS yaddaşı diskə köçürür (hazırda {swap} GB). Disk bu qədər dolu olanda köçürməyə yer qalmır və macOS proqramları məcburi bağlamağa başlayır — «tətbiq yaddaşı qalmadı» pəncərəsi budur. Əvvəl yer aç; yenidən yarana bilən ən böyük şeylər aşağıdadır.",
+        "hog.t": "{name} {size} tutur — bu Mac-in {ram} GB-ının {pct}%-i",
+        "hog.d": "Bir proqramın bu qədər yaddaş tutması qalan hər şeyi swap-a itələyir. Açılanda bu qədər lazım deyildisə, bağlayıb yenidən açmaq yaddaşı geri qaytarır.",
+        "hog.browser.d": "Demək olar ki, həmişə günahkar brauzer yox, bir-iki tabdır. Brauzerin Task Manager-ini aç (Chrome-da Shift+Esc), yaddaşa görə sırala və ən yuxarıdakı tabı bağla. Bağlayıb yenidən açmaq da olar — tablar geri gəlir, yaddaş boşalır.",
         "uptime.t": "{days} gündür işləyir və swap təzyiq altındadır",
         "uptime.d": "Uzun işləmə müddəti özlüyündə problem deyil, amma dolu swap ilə "
                     "birlikdə yenidən başlatmaq ən ucuz tam sıfırlamadır.",
@@ -231,6 +241,7 @@ STRINGS = {
         "ui.vitals": "Показатели",
         "ui.free": "Свободно памяти",
         "ui.swap": "Подкачка",
+        "ui.disk": "Свободно на диске",
         "ui.uptime": "Время работы",
         "ui.days": "дн.",
         "ui.recoverable": "Можно вернуть",
@@ -300,13 +311,17 @@ STRINGS = {
                     "ничего.",
         "sim.t": "Процессов iOS Simulator: {n}, занимают {size}",
         "sim.d": "Симуляторы продолжают работать после закрытия Xcode.",
-        "swap.t": "Подкачка заполнена на {pct}% ({used} из {total} ГБ)",
-        "swap.d": "Подкачка сама не уменьшается. После {days} дн. работы полностью "
-                  "освободить её может только перезагрузка.",
+        "swap.t": "{used} ГБ памяти вытеснено на диск (в этом Mac {ram} ГБ ОЗУ)",
+        "swap.d": "Такая подкачка значит, что запущенным программам нужно больше памяти, чем есть в Mac, и каждое переключение ждёт диск. Сама она не уменьшится: закройте самую большую программу из списка или перезагрузитесь — Mac работает {days} дн.",
         "pressure.t": "Свободно всего {pct}% памяти",
         "pressure.d": "Ниже примерно четверти свободной памяти macOS начинает активно "
                       "сжимать и выгружать, и всё становится медленным — именно это "
                       "состояние заканчивается окном «системе не хватает памяти».",
+        "disk.t": "На диске свободно всего {free} ГБ",
+        "disk.d": "Когда ОЗУ не хватает, macOS выгружает память на диск (сейчас {swap} ГБ). Если диск так заполнен, выгружать некуда, и macOS начинает принудительно закрывать программы — это и есть окно «системе не хватает памяти». Сначала освободите место; самые крупные восстановимые объекты перечислены ниже.",
+        "hog.t": "{name} занимает {size} — {pct}% от {ram} ГБ этого Mac",
+        "hog.d": "Одна программа с таким объёмом памяти вытесняет всё остальное в подкачку. Если при запуске ей столько не требовалось, перезапуск вернёт память.",
+        "hog.browser.d": "Почти всегда дело в одной-двух вкладках, а не в самом браузере. Откройте диспетчер задач браузера (Shift+Esc в Chrome), отсортируйте по памяти и закройте верхнюю вкладку. Перезапуск тоже помогает — вкладки вернутся, память освободится.",
         "uptime.t": "Работает {days} дн., подкачка под давлением",
         "uptime.d": "Долгое время работы само по себе не проблема, но вместе с заполненной "
                     "подкачкой перезагрузка — самый дешёвый полный сброс.",
