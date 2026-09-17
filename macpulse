@@ -320,6 +320,119 @@ def space_holders(min_gb=1.0, limit=5, budget_s=8.0):
     return [f"{mb(kb)}  {raw}" for kb, raw in rows[:limit]]
 
 
+# Safe to delete: caches an app rebuilds, build products, old logs, the Trash. Never
+# anything a person or another app would have to recreate by hand — no Downloads, no
+# Documents, no container disks, no other app's data directory. `age_days` means only
+# entries untouched for that long are eligible, so today's working caches stay.
+RECLAIMABLE = [
+    ("~/.Trash", 0),
+    ("~/Library/Caches", 1),
+    ("~/Library/Logs", 30),
+    ("~/Library/Developer/Xcode/DerivedData", 0),
+    ("~/Library/Developer/CoreSimulator/Caches", 0),
+    ("~/Library/Application Support/Google/Chrome/OptGuideOnDeviceModel", 0),
+]
+
+# Caches that are cheap to delete and expensive to get back: browser engines a test
+# suite downloads, model weights, package archives pulled over a slow link. Reclaiming
+# a gigabyte is not worth an hour of re-downloading, so these are left alone.
+RECLAIM_EXEMPT = re.compile(
+    r"ms-playwright|puppeteer|huggingface|/models?$|\.ollama|Homebrew/downloads", re.I)
+
+
+def _entry_kb(path):
+    try:
+        out = subprocess.run(["du", "-sk", path], capture_output=True, text=True,
+                             timeout=10).stdout
+        return int(out.split(None, 1)[0])
+    except (subprocess.TimeoutExpired, ValueError, IndexError):
+        return 0
+
+
+def reclaim_candidates(budget_s=6.0):
+    """Top-level entries under RECLAIMABLE that are safe and stale enough to delete."""
+    deadline = time.time() + budget_s
+    out = []
+    for raw, age_days in RECLAIMABLE:
+        root = pathlib.Path(os.path.expanduser(raw))
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        cutoff = time.time() - age_days * 86400
+        for entry in entries:
+            if time.time() > deadline:
+                return out
+            try:
+                if age_days and entry.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            if RECLAIM_EXEMPT.search(str(entry)):
+                continue
+            kb = _entry_kb(str(entry))
+            if kb >= 20 * 1024:                 # ignore anything under 20 MB: not worth it
+                out.append((str(entry), kb))
+    return out
+
+
+def _reclaimer(candidates):
+    def do(lang):
+        freed = 0
+        for path, kb in candidates:
+            try:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.unlink(path)
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
+                    if os.path.exists(path):    # partially removed: count what went
+                        kb -= _entry_kb(path)
+                freed += max(0, kb)
+            except OSError:
+                continue
+        return t(lang, "res.freed", size=mb(freed))
+    return do
+
+
+def _quitter(app_name, reopen):
+    """Quit an app the polite way, and bring it back if it is a browser.
+
+    `quit` through AppleScript is a request, not a kill: the app saves its state and
+    asks about unsaved work, and a browser restores its tabs when it comes back — which
+    is what makes this safe to offer as a button. SIGKILL would lose work and is never
+    used here.
+    """
+    def do(lang):
+        subprocess.run(["osascript", "-e", f'tell application "{app_name}" to quit'],
+                       capture_output=True, text=True, timeout=30)
+        for _ in range(20):                    # give it up to 10 s to go
+            time.sleep(0.5)
+            alive = subprocess.run(["pgrep", "-x", app_name[:15]],
+                                   capture_output=True, text=True).stdout.strip()
+            if not alive:
+                break
+        if reopen:
+            subprocess.run(["open", "-a", app_name], capture_output=True, text=True)
+            return t(lang, "res.reopened", name=app_name)
+        return t(lang, "res.quit", name=app_name)
+    return do
+
+
+def _own_app_bundles(procs):
+    """Bundles this scan is running inside — quitting one would kill the tool itself."""
+    by_pid = {p.pid: p for p in procs}
+    out, pid, guard = set(), os.getpid(), 0
+    while pid in by_pid and guard < 20:
+        m = re.search(r"/([^/]+)\.app/", by_pid[pid].cmd)
+        if m:
+            out.add(m.group(1))
+        pid = by_pid[pid].ppid
+        guard += 1
+    return out
+
+
 def _top_kb(text):
     m = re.match(r"([\d.]+)([BKMG])", text)
     if not m:
@@ -371,7 +484,7 @@ class Finding:
 
     def __init__(self, sev, key, category, title_key, detail_key, params,
                  cost_kb=0, core_hours=0.0, fix=None, fix_key=None, fix_params=None,
-                 evidence=None):
+                 evidence=None, durable=True):
         self.sev = sev              # "critical" | "warn" | "info"
         self.key = key
         self.category = category
@@ -384,6 +497,11 @@ class Finding:
         self.fix_key = fix_key
         self.fix_params = fix_params or {}
         self.evidence = evidence or []
+        # Does pressing the fix actually leave the machine that much better off? An app
+        # that is quit and reopened takes part of its memory straight back, so counting
+        # its full footprint as "recoverable" would be the same overclaim this tool was
+        # built to argue against. Only durable fixes are added up.
+        self.durable = durable
 
     def title(self, lang):
         return t(lang, self.title_key, **self.params)
@@ -715,12 +833,44 @@ def check_disk(_procs, mem):
     free_gb = mem.get("disk_free", 0) / GB
     if not mem.get("disk_total") or free_gb >= DISK_WARN_GB:
         return []
+    candidates = reclaim_candidates()
+    reclaimable_kb = sum(kb for _, kb in candidates)
+    fix = fix_key = None
+    if reclaimable_kb >= 1048576:               # only offer a button worth pressing
+        fix, fix_key = _reclaimer(candidates), "disk.fix"
     return [Finding(
         "critical" if free_gb < DISK_CRITICAL_GB else "warn", "disk", CAT_MEMORY,
         "disk.t", "disk.d",
         {"free": f"{free_gb:.1f}", "swap": f"{mem['swap_used_mb'] / 1024:.1f}"},
+        cost_kb=reclaimable_kb, fix=fix, fix_key=fix_key,
+        fix_params={"size": mb(reclaimable_kb)},
         evidence=space_holders(),
     )]
+
+
+def check_disk_forecast(_procs, mem):
+    """Where the disk is heading, while there is still room to act.
+
+    A threshold only fires once the machine is already in trouble. The free space on a
+    working Mac trends, and a machine losing a gigabyte a day has a date with the same
+    wall — this says so a week early, which is the only kind of warning that is cheap
+    to act on.
+    """
+    free_gb = mem.get("disk_free", 0) / GB
+    if free_gb < DISK_WARN_GB:
+        return []                               # already a finding of its own
+    trend = hist.disk_slope()
+    if not trend:
+        return []
+    slope, newest, span = trend
+    if slope >= -0.2:                           # flat or growing
+        return []
+    days_left = (newest - DISK_CRITICAL_GB) / -slope
+    if days_left > 14:
+        return []
+    return [Finding("warn", "disk.trend", CAT_MEMORY, "disktrend.t", "disktrend.d",
+                    {"rate": f"{-slope:.1f}", "days": f"{days_left:.0f}",
+                     "free": f"{newest:.0f}", "span": span})]
 
 
 def check_app_hogs(procs, mem):
@@ -728,17 +878,26 @@ def check_app_hogs(procs, mem):
     ram_kb = mem["total"] / 1024
     if not ram_kb:
         return []
+    own = _own_app_bundles(procs)
     out = []
     for name, kb in sorted(app_footprints(procs).items(), key=lambda kv: -kv[1]):
         share = kb / ram_kb
         if share < HOG_WARN_SHARE:
             break
+        browser = bool(BROWSER_APP.search(name))
+        # A finding with no button is a complaint. The only ones left without one are
+        # the app this scan is running inside (quitting it kills the tool mid-fix) and
+        # anything that is not a real .app bundle we can address by name.
+        offer = name not in own and os.path.isdir(f"/Applications/{name}.app")
         out.append(Finding(
             "critical" if share >= HOG_CRITICAL_SHARE else "warn", f"hog:{name}", CAT_MEMORY,
-            "hog.t", "hog.browser.d" if BROWSER_APP.search(name) else "hog.d",
+            "hog.t", "hog.browser.d" if browser else "hog.d",
             {"name": name, "size": mb(kb), "pct": f"{share * 100:.0f}",
              "ram": f"{mem['total'] / GB:.0f}"},
-            cost_kb=int(kb),
+            cost_kb=int(kb), durable=False,
+            fix=_quitter(name, browser) if offer else None,
+            fix_key=("hog.fix.reopen" if browser else "hog.fix.quit") if offer else None,
+            fix_params={"name": name},
         ))
     return out
 
@@ -764,7 +923,7 @@ def check_swarms(procs, _mem):
 
 
 CHECKS = [check_cpu_burners, check_ghosts, check_ai_toolchain, check_headless_browsers,
-          check_stale_locks, check_idle_heavy, check_memory, check_app_hogs, check_disk,
+          check_stale_locks, check_idle_heavy, check_memory, check_app_hogs, check_disk, check_disk_forecast,
           check_swarms]
 
 
@@ -855,7 +1014,7 @@ def render_terminal(findings, mem, points, lang):
         return
 
     # Only what pressing Fix would really free — same rule as the app.
-    reclaim = sum(f.cost_kb for f in findings if f.fix)
+    reclaim = sum(f.cost_kb for f in findings if f.fix and f.durable)
     hours = sum(f.core_hours for f in findings)
     head = []
     if reclaim:
@@ -907,7 +1066,7 @@ def render_html(findings, mem, points, path, lang):
         </article>""")
 
     # Only what pressing Fix would really free — same rule as the app.
-    reclaim = sum(f.cost_kb for f in findings if f.fix)
+    reclaim = sum(f.cost_kb for f in findings if f.fix and f.durable)
     colour = "#30d158" if points >= 85 else "#ff9f0a" if points >= 65 else "#ff453a"
     doc = f"""<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -986,11 +1145,15 @@ def apply_fixes(findings, assume_yes, lang):
 
 APP_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>macpulse</title>
+<link rel="icon" href="data:,">
 <style>
 :root{
-  --bg:#ECECEE; --side:#E3E3E6; --card:#FFFFFF; --ink:#1D1D1F; --soft:#6E6E73;
-  --faint:#6C6C70; --sep:#E0E0E3; --sel:#00857F; --selfg:#FFFFFF;
-  --crit:#D0342C; --warn:#B0710A; --ok:#1E8E4E; --tint:#00857F;
+  /* Light-theme text colours are chosen against the DARKEST surface they land on
+     (the sidebar, #E3E3E6), not against white — measured, not eyeballed. Every value
+     here clears WCAG AA 4.5:1 at the 10.5-12px sizes this UI actually uses. */
+  --bg:#ECECEE; --side:#E3E3E6; --card:#FFFFFF; --ink:#1D1D1F; --soft:#5A5A5F;
+  --faint:#5A5A5F; --sep:#E0E0E3; --sel:#00857F; --selfg:#FFFFFF;
+  --crit:#BF2B23; --warn:#8F5B00; --ok:#157039; --tint:#00857F;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
   --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
 }
@@ -1044,8 +1207,9 @@ nav .lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar button.primary{background:var(--sel);border-color:var(--sel);color:var(--selfg)}
 .bar button:disabled{opacity:.4;cursor:default}
 button:focus-visible,nav button:focus-visible{outline:2px solid var(--tint);outline-offset:2px}
-.pane{padding:2px 26px 40px;max-width:720px;min-width:0}
+.pane{padding:2px 26px 40px;max-width:820px;min-width:0;margin:0 auto}
 
+.more{color:var(--faint);text-transform:none;letter-spacing:0}
 .grouphead{font-size:11.5px;color:var(--faint);margin:20px 0 6px 12px;
   letter-spacing:.02em;font-weight:500}
 .group{background:var(--card);border-radius:10px;overflow:hidden}
@@ -1083,6 +1247,9 @@ button:focus-visible,nav button:focus-visible{outline:2px solid var(--tint);outl
 .status .who{min-width:0;overflow-wrap:anywhere}
 .status .who b{font-size:15px;font-weight:600;letter-spacing:-.01em;display:block}
 .status .who span{font-size:12px;color:var(--soft);display:block;margin-top:2px}
+.spark{margin-left:auto;text-align:right;padding-left:18px}
+.spark svg{display:block}
+.spark small{font-size:10.5px;color:var(--faint);font-family:var(--mono)}
 .ev{margin:6px 0 0;padding:0;list-style:none;font-family:var(--mono);font-size:11.5px;
   color:var(--soft);word-break:break-all;display:flex;flex-direction:column;gap:1px}
 .empty{padding:34px 16px;text-align:center;color:var(--soft);font-size:13px}
@@ -1178,6 +1345,23 @@ function dial(score){
     <span class="n" style="color:${c}">${score}</span></div>`;
 }
 
+function spark(trend){
+  const pts = (trend||[]).map((v,i)=>[i,v]).filter(p=>p[1]!==null);
+  if(pts.length < 3) return "";
+  const W=104, H=30, n=(trend||[]).length-1 || 1;
+  const x=i=>i/n*W, y=v=>H-2-(Math.max(0,Math.min(100,v))/100)*(H-4);
+  const d = pts.map((p,i)=>(i?"L":"M")+x(p[0]).toFixed(1)+" "+y(p[1]).toFixed(1)).join(" ");
+  const first = pts[0][1], last = pts[pts.length-1][1], delta = last-first;
+  const col = delta <= -8 ? "var(--crit)" : (delta >= 8 ? "var(--ok)" : "var(--faint)");
+  const sign = delta>0 ? "+" : "";
+  return `<div class="spark"><svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"
+      role="img" aria-label="${esc(T("ui.trend","14-day trend"))}: ${first} → ${last}">
+      <path d="${d}" fill="none" stroke="${col}" stroke-width="1.6"
+            stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${x(pts[pts.length-1][0]).toFixed(1)}" cy="${y(last).toFixed(1)}" r="2.2" fill="${col}"/>
+    </svg><small>${esc(T("ui.trend","14 days"))} ${sign}${delta}</small></div>`;
+}
+
 function findingRow(f){
   const bits = [];
   if(f.cost_kb) bits.push((f.cost_kb/1024).toFixed(0)+" MB");
@@ -1235,7 +1419,7 @@ function paint(){
   if(PANE==="overview"){
     const m = D.memory;
     h += `<div class="status">${dial(D.score)}<div class="who">
-      <b>${esc(D.grade)}</b><span>${esc(T("ui.readonly",""))}</span></div></div>`;
+      <b>${esc(D.grade)}</b><span>${esc(T("ui.readonly",""))}</span></div>${spark(D.trend)}</div>`;
     h += `<p class="grouphead">${esc(T("ui.vitals","Vitals"))}</p><div class="group">`;
     h += [[T("ui.free","Memory free"), m.free_pct+"%"],
           [T("ui.swap","Swap"), (m.swap_used_mb/1024).toFixed(1)+" / "+(m.swap_total_mb/1024).toFixed(1)+" GB"],
@@ -1245,8 +1429,15 @@ function paint(){
       .map(([k,v])=>`<div class="row"><div class="txt"><b>${esc(k)}</b></div>
         <span class="val">${esc(v)}</span></div>`).join("");
     h += `</div>`;
-    const top = D.findings.filter(f=>f.severity!=="info").slice(0,4);
-    h += `<p class="grouphead">${esc(T("ui.findings","Findings"))} (${D.findings.length})</p>`;
+    // Count what is on screen, not what exists: the overview lists the findings that
+    // need a decision, and a header claiming five while showing three is a small lie
+    // in a tool whose entire value is being trusted about numbers.
+    const serious = D.findings.filter(f=>f.severity!=="info");
+    const top = serious.slice(0,4);
+    const rest = D.findings.length - top.length;
+    h += `<p class="grouphead">${esc(T("ui.findings","Findings"))} (${top.length})`
+       + (rest>0 ? ` <span class="more">+${rest} ${esc(T("ui.insections","in the sections"))}</span>` : "")
+       + `</p>`;
     h += top.length ? `<div class="group">${top.map(findingRow).join("")}</div>`
       : `<div class="group"><div class="empty"><b>${esc(T("ui.nofindings",""))}</b>
          ${esc(T("ui.allgood",""))}</div></div>`;
@@ -1354,7 +1545,8 @@ def serve_ui(port, default_lang):
         return {"version": VERSION, "lang": lang, "strings": bundle(lang),
                 "host": socket.gethostname().replace(".local", ""),
                 "score": points, "grade": t(lang, grade_key(points)), "memory": mem,
-                "recoverable_kb": sum(f.cost_kb for f in found if f.fix),
+                "recoverable_kb": sum(f.cost_kb for f in found if f.fix and f.durable),
+                "trend": hist.trend(),      # the panel draws it; a scan alone cannot
                 "findings": items}
 
     class Handler(http.server.BaseHTTPRequestHandler):

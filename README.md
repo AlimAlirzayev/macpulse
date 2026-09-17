@@ -1,6 +1,6 @@
 # macpulse
 
-**Your Mac isn't slow because the disk is full.**
+**Your Mac isn't slow because the disk is full — but it can still be stopped by it.**
 
 Every Mac cleaner measures the same thing: disk space. Caches, logs, language files,
 "junk". That model was built for a Mac whose problem was a full drive, and it is blind
@@ -27,12 +27,19 @@ No admin rights. Nothing installed outside your home folder. Read-only until you
 | **Headless browser leftovers** | Chrome instances abandoned by automation scripts, sometimes running for days. |
 | **Stale lock files** | The reason an app silently refuses to launch (error `-1712`). |
 | **Idle Docker** | A Linux VM kept alive with zero containers running. |
-| **Swap saturation** | With an honest verdict. Where the real answer is "restart", it says restart. |
+| **Swap saturation** | Measured against your RAM, not as a share of a swap file macOS grows on demand — the percentage version calls a Mac with 8 GB in swap "80% full" and healthy. |
+| **Disk headroom** | Memory spills onto the disk, so a full disk is a memory failure waiting to happen: that is the "your system has run out of application memory" dialog. Warns while there is still room to act, and can reclaim caches, build products and the Trash. |
+| **Where the disk is heading** | Free space trends. Losing a gigabyte a day means a date with the same wall, said a week early. |
+| **Memory hogs** | Per-app footprint the way the Force Quit window measures it — `ps` hides compressed and swapped pages, which for a browser open all week is most of it. One press quits the app and brings it back. |
 
 ## How it looks
 
-A live score in the menu bar. Click it for findings, each with **how many days it has
-been true** — the thing a single scan can never tell you.
+A live score in the menu bar, with swap and free disk under it. Click it for findings,
+each with **how many days it has been true** — the thing a single scan can never tell you.
+
+Between full scans a sentinel reads two kernel counters every minute, so the moment
+memory starts spilling onto a disk that cannot take it, you hear about it — once, with
+the reason and what to do, not on every scan.
 
 `Open panel…` gives a fuller view laid out like System Settings, with a Fix button on
 each finding.
@@ -46,6 +53,7 @@ macpulse --report        # write an HTML report to the Desktop
 macpulse --fix           # offer each fix one at a time
 macpulse --fix --yes     # apply every safe fix without asking
 macpulse --json          # machine-readable
+macpulse --brief         # one line per warning, silent when healthy (for AI assistants)
 macpulse --lang az|en|ru # default follows your system language
 ```
 

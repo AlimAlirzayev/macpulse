@@ -59,11 +59,24 @@ CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 """
 
 
+# Added in 1.3: the absolute numbers. swap_pct was stored against a swap total macOS
+# grows on demand, so the column cannot answer "how much was actually in swap" — and a
+# disk that loses a gigabyte a day is only visible if the free space is kept.
+MIGRATIONS = [
+    ("samples", "disk_free_gb", "REAL"),
+    ("samples", "swap_used_gb", "REAL"),
+]
+
+
 def _connect():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=5)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    for table, column, kind in MIGRATIONS:
+        cols = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
     return con
 
 
@@ -79,9 +92,12 @@ def record(score, mem, findings):
     try:
         with _connect() as con:
             con.execute(
-                "INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO samples (ts,score,free_pct,swap_pct,findings,"
+                "fixable_kb,disk_free_gb,swap_used_gb) VALUES (?,?,?,?,?,?,?,?)",
                 (now, score, mem.get("free_pct"), round(swap_pct, 1), len(findings),
-                 sum(f.cost_kb for f in findings if f.fix)),
+                 sum(f.cost_kb for f in findings if f.fix),
+                 round(mem.get("disk_free", 0) / 1073741824, 2),
+                 round(mem.get("swap_used_mb", 0) / 1024, 2)),
             )
             for f in findings:
                 row = con.execute("SELECT first_seen, times FROM seen WHERE key=?",
@@ -123,6 +139,36 @@ def trend(days=14, buckets=14):
         vals = [r["score"] for r in rows if lo <= r["ts"] < hi]
         out.append(round(sum(vals) / len(vals)) if vals else None)
     return out
+
+
+def disk_slope(days=7, min_samples=8):
+    """GB of free disk lost per day, from the daily *minimum* free space.
+
+    The minimum, not the average: what matters is how close the machine came to the
+    wall each day, and a single hourly sample can be taken right after a cache was
+    cleared. Returns (slope_gb_per_day, newest_free_gb, days_of_data) or None when
+    there is not enough history to say anything honest.
+    """
+    now = time.time()
+    try:
+        with _connect() as con:
+            rows = con.execute(
+                "SELECT CAST(ts/86400 AS INTEGER) AS day, MIN(disk_free_gb) AS free "
+                "FROM samples WHERE ts > ? AND disk_free_gb IS NOT NULL "
+                "GROUP BY day ORDER BY day", (now - days * 86400,)).fetchall()
+    except sqlite3.Error:
+        return None
+    pts = [(r["day"], r["free"]) for r in rows if r["free"] is not None]
+    if len(pts) < min_samples or len({d for d, _ in pts}) < 3:
+        return None
+    n = len(pts)
+    mx = sum(d for d, _ in pts) / n
+    my = sum(f for _, f in pts) / n
+    denom = sum((d - mx) ** 2 for d, _ in pts)
+    if denom == 0:
+        return None
+    slope = sum((d - mx) * (f - my) for d, f in pts) / denom      # GB per day
+    return (slope, pts[-1][1], pts[-1][0] - pts[0][0] + 1)
 
 
 def last_score():

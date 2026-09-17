@@ -99,6 +99,7 @@ static BOOL EarlyWarningKey(NSString *key) {
 @property (assign) NSInteger lastScore;
 @property (assign) BOOL busy;
 @property (assign) BOOL introduced;
+@property (copy) NSString *vitals;
 @end
 
 @implementation MPAgent
@@ -213,6 +214,14 @@ static BOOL EarlyWarningKey(NSString *key) {
         self.strings = payload[@"strings"];
     }
     NSString *grade = payload[@"grade"] ?: @"";
+    NSDictionary *m = [payload[@"memory"] isKindOfClass:NSDictionary.class] ? payload[@"memory"] : nil;
+    if (m) {
+        NSString *swapLabel = [self s:@"ui.swap" fallback:@"Swap"];
+        NSString *diskLabel = [self s:@"ui.disk" fallback:@"Disk free"];
+        self.vitals = [NSString stringWithFormat:@"%@ %.1f GB · %@ %.0f GB",
+                       swapLabel, [m[@"swap_used_mb"] doubleValue] / 1024.0,
+                       diskLabel, [m[@"disk_free"] doubleValue] / 1073741824.0];
+    }
     NSArray *findings = [payload[@"findings"] isKindOfClass:NSArray.class]
                         ? payload[@"findings"] : @[];
 
@@ -264,6 +273,19 @@ static BOOL EarlyWarningKey(NSString *key) {
     NSMenuItem *head = [[NSMenuItem alloc] initWithTitle:headText action:nil keyEquivalent:@""];
     head.enabled = NO;
     [menu addItem:head];
+
+    // The two numbers this tool exists for, where a glance can reach them. Swap says
+    // how much memory has spilled onto the disk; free space says how much room is left
+    // for it to spill into. Either one alone hides the failure they cause together.
+    if (self.vitals.length > 0) {
+        NSMenuItem *v = [[NSMenuItem alloc] initWithTitle:self.vitals action:nil keyEquivalent:@""];
+        v.enabled = NO;
+        v.attributedTitle = [[NSAttributedString alloc] initWithString:self.vitals
+            attributes:@{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:11
+                                                weight:NSFontWeightRegular],
+                         NSForegroundColorAttributeName: [NSColor secondaryLabelColor]}];
+        [menu addItem:v];
+    }
 
     if (findings.count > 0) {
         [menu addItem:[NSMenuItem separatorItem]];
