@@ -1237,7 +1237,10 @@ def render_terminal(findings, mem, points, lang, breakdown=None):
     print()
     print(f"  {S.B}macpulse{S.R} {S.D}v{VERSION}{S.R}   {S.D}{t(lang, 'app.tagline')}{S.R}")
     print(f"  {hr()}")
-    print(f"  {colour}{S.B}{points}/100 — {t(lang, grade_key(points))}{S.R}   "
+    gkey = grade_key_for(points, findings, CHECK_STATUS["failed"])
+    if gkey == "grade.partial":
+        colour = S.YEL
+    print(f"  {colour}{S.B}{points}/100 — {t(lang, gkey)}{S.R}   "
           f"{colour}{'█' * filled}{S.D}{'░' * (bar_w - filled)}{S.R}")
     print()
     if breakdown:
@@ -1253,7 +1256,8 @@ def render_terminal(findings, mem, points, lang, breakdown=None):
     print()
 
     if not findings:
-        print(f"  {S.GRN}{t(lang, 'ui.allgood')}{S.R}\n")
+        if not CHECK_STATUS["failed"]:    # "good shape" only when every sensor answered
+            print(f"  {S.GRN}{t(lang, 'ui.allgood')}{S.R}\n")
         return
 
     # Only what pressing Fix would really free — same rule as the app.
@@ -1342,13 +1346,13 @@ body{{background:#000;color:#f5f5f7}} .f{{background:#1c1c1e;border-color:#2c2c2
 .tag.fix{{background:#0f3d1a;color:#7ee39a}}}}
 </style></head><body><div class="wrap">
 <h1>macpulse</h1><p class="sub">{html.escape(t(lang, 'app.tagline'))} · {time.strftime('%d.%m.%Y %H:%M')}</p>
-<div class="score"><b>{points}</b><span>/100 — {html.escape(t(lang, grade_key(points)))}</span></div>
+<div class="score"><b>{points}</b><span>/100 — {html.escape(t(lang, grade_key_for(points, findings, CHECK_STATUS["failed"])))}</span></div>
 <div class="bar"><i></i></div>
 <p class="meta">{mem['total'] / GB:.0f} GB RAM · {mem['free_pct']}% ·
 {mem['swap_used_mb'] / 1024:.1f}/{mem['swap_total_mb'] / 1024:.1f} GB ·
 {mem['uptime_days']:.0f} {html.escape(t(lang, 'ui.days'))}
 {f" · <b>{mb(reclaim)}</b>" if reclaim else ""}</p>
-{"".join(rows) or f"<p>{html.escape(t(lang, 'ui.allgood'))}</p>"}
+{"".join(rows) or ("" if CHECK_STATUS["failed"] else f"<p>{html.escape(t(lang, 'ui.allgood'))}</p>")}
 </div></body></html>"""
     pathlib.Path(path).write_text(doc)
     return path
