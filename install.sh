@@ -76,11 +76,13 @@ if [ -n "$SRC_DIR" ]; then
   # release with one altered file must not install. A developer tree without the file
   # (or with MACPULSE_DEV=1 while editing) installs as-is.
   if [ -f "$SRC_DIR/SHA256SUMS" ] && [ "${MACPULSE_DEV:-0}" != "1" ]; then
-    for f in $PROGRAM_FILES; do
+    # menubar.m is compiled into the login agent, so it is verified like the rest.
+    LOCAL_VERIFY="$PROGRAM_FILES"; [ -f "$SRC_DIR/menubar.m" ] && LOCAL_VERIFY="$PROGRAM_FILES menubar.m"
+    for f in $LOCAL_VERIFY; do
       awk -v f="$f" '$2 == f || $2 == "*" f' "$SRC_DIR/SHA256SUMS" | grep -q . \
         || die "$f is not listed in SHA256SUMS — nothing was installed"
     done
-    (cd "$SRC_DIR" && for f in $PROGRAM_FILES; do
+    (cd "$SRC_DIR" && for f in $LOCAL_VERIFY; do
        awk -v f="$f" '$2 == f || $2 == "*" f' SHA256SUMS; done | shasum -a 256 -c - >/dev/null 2>&1) \
       || die "checksum mismatch against SHA256SUMS — nothing was installed (run release.sh after editing)"
     ok "checksums verified (local copy)"
@@ -138,8 +140,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>macpulse</string>
   <key>CFBundleDisplayName</key><string>macpulse</string>
   <key>CFBundleIdentifier</key><string>io.macpulse.app</string>
-  <key>CFBundleVersion</key><string>1.5.0</string>
-  <key>CFBundleShortVersionString</key><string>1.5.0</string>
+  <key>CFBundleVersion</key><string>1.5.1</string>
+  <key>CFBundleShortVersionString</key><string>1.5.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>macpulse</string>
   <key>CFBundleIconFile</key><string>macpulse</string>

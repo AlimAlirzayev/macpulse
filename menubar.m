@@ -106,8 +106,32 @@ static BOOL ScanIsComplete(NSDictionary *payload) {
 
 // The status-item text, as plain characters. Both the live menu bar and --print-title
 // go through this one function, so what the test prints is what the user sees.
+// JSON null arrives as NSNull, which has no integerValue: calling it aborted the agent
+// (refuter, round 5). Every number from the payload goes through this guard.
+static BOOL IsNumber(id v) { return [v isKindOfClass:NSNumber.class]; }
+
+// Drop every JSON null (NSNull) at parse time, recursively. A missing key then reads as
+// nil, which the `?:` fallbacks and nil-messaging already handle; an NSNull would raise
+// on the first doubleValue / string use and take the whole agent down.
+static id StripNulls(id obj) {
+    if ([obj isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            if (![v isKindOfClass:NSNull.class]) out[k] = StripNulls(v);
+        }];
+        return out;
+    }
+    if ([obj isKindOfClass:NSArray.class]) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id v in (NSArray *)obj)
+            if (![v isKindOfClass:NSNull.class]) [out addObject:StripNulls(v)];
+        return out;
+    }
+    return obj;
+}
+
 static NSString *TitleForPayload(NSDictionary *payload) {
-    if (![payload isKindOfClass:NSDictionary.class] || !payload[@"score"]) return @"  ?";
+    if (![payload isKindOfClass:NSDictionary.class] || !IsNumber(payload[@"score"])) return @"  ?";
     return [NSString stringWithFormat:@"◍ %ld%@", (long)[payload[@"score"] integerValue],
             ScanIsComplete(payload) ? @"" : @"?"];
 }
@@ -126,6 +150,7 @@ static NSDictionary *RunScan(BOOL loginShell) {
         [task waitUntilExit];
     }
     id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    obj = StripNulls(obj);
     return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
 }
 
@@ -237,11 +262,16 @@ static NSDictionary *RunScan(BOOL loginShell) {
         [self buildMenuWithScore:-1 grade:@"macpulse unavailable" findings:@[]];
         return;
     }
+    if (!IsNumber(payload[@"score"])) {
+        self.item.button.title = @"  ?";
+        [self buildMenuWithScore:-1 grade:@"macpulse unavailable" findings:@[]];
+        return;
+    }
     NSInteger score = [payload[@"score"] integerValue];
     if ([payload[@"strings"] isKindOfClass:NSDictionary.class]) {
         self.strings = payload[@"strings"];
     }
-    NSString *grade = payload[@"grade"] ?: @"";
+    NSString *grade = [payload[@"grade"] isKindOfClass:NSString.class] ? payload[@"grade"] : @"";
     NSDictionary *m = [payload[@"memory"] isKindOfClass:NSDictionary.class] ? payload[@"memory"] : nil;
     if (m) {
         NSString *swapLabel = [self s:@"ui.swap" fallback:@"Swap"];
@@ -268,6 +298,7 @@ static NSDictionary *RunScan(BOOL loginShell) {
     if ([payload[@"score_breakdown"] isKindOfClass:NSArray.class]) {
         for (NSDictionary *row in payload[@"score_breakdown"]) {
             if (![row isKindOfClass:NSDictionary.class]) continue;
+            if (!IsNumber(row[@"points"])) continue;
             NSInteger pts = [row[@"points"] integerValue];
             if (pts > best && [row[@"reason"] isKindOfClass:NSString.class]) {
                 best = pts;

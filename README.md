@@ -98,6 +98,13 @@ if set, else `~/Documents/OS-Output` if that folder exists, else `~/Documents/ma
 
 - **AI session age.** The Claude Code finding shows how long each session has been up.
 
+## 1.5.1 (fixes from the release review)
+
+- A scan whose swap sensor failed no longer records 0 GB, so the next scan cannot raise a false swap-growth warning.
+- `install.sh` verifies `menubar.m` on the local-copy path too (it is compiled into the login agent).
+- The menu bar agent no longer crashes on JSON `null` values.
+- Idle-session selection now ignores sessions busy at scan time and processes that only carry a `.../claude` path. The stop button re-checks each PID's command before it sends SIGTERM, so a recycled PID is never signalled.
+
 ## What's new in 1.5
 
 - **Honest menu bar.** When a scan could not measure everything (`"complete": false` in

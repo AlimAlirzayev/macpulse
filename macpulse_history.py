@@ -97,7 +97,10 @@ def record(score, mem, findings):
                 (now, score, mem.get("free_pct"), round(swap_pct, 1), len(findings),
                  sum(f.cost_kb for f in findings if f.fix),
                  round(mem.get("disk_free", 0) / 1073741824, 2),
-                 round(mem.get("swap_used_mb", 0) / 1024, 2)),
+                 # A failed swap sensor is stored as unknown (NULL), never as 0 GB: a
+                 # zero would make the next honest reading look like sudden growth.
+                 None if any(str(x).startswith("swap") for x in (mem.get("sensors_failed") or []))
+                 else round(mem.get("swap_used_mb", 0) / 1024, 2)),
             )
             for f in findings:
                 row = con.execute("SELECT first_seen, times FROM seen WHERE key=?",

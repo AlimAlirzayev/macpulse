@@ -109,3 +109,47 @@ class AutoFix(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundFiveRegressions(unittest.TestCase):
+    """Refuter round 5: busy-now sessions, look-alike paths, pid reuse, blind swap."""
+
+    def test_session_busy_right_now_is_kept(self):
+        p = proc(10, 20, cpu_s=0)
+        p.cpu = 95.0
+        self.assertEqual(mp.idle_sessions([p], set()), [])
+
+    def test_editor_holding_a_claude_path_is_not_a_session(self):
+        p = proc(10, 30, cmd="/usr/bin/vim /Users/x/notes/claude ")
+        self.assertEqual(mp.idle_sessions([p], set()), [])
+
+    def test_terminator_skips_a_recycled_pid(self):
+        from unittest import mock
+        sent = []
+        cp = mp.subprocess.CompletedProcess([], 0, "/usr/bin/some-other-program\n", "")
+        with mock.patch.object(mp.subprocess, "run", return_value=cp), \
+                mock.patch.object(mp.os, "kill", side_effect=lambda pid, sig: sent.append(pid)):
+            mp._terminator([4242], {4242: CLAUDE})("en")
+        self.assertEqual(sent, [])
+
+    def test_terminator_signals_the_same_process(self):
+        from unittest import mock
+        sent = []
+        cp = mp.subprocess.CompletedProcess([], 0, CLAUDE + "\n", "")
+        with mock.patch.object(mp.subprocess, "run", return_value=cp), \
+                mock.patch.object(mp.os, "kill", side_effect=lambda pid, sig: sent.append(pid)):
+            mp._terminator([4242], {4242: CLAUDE})("en")
+        self.assertEqual(sent, [4242])
+
+    def test_blind_swap_scan_makes_no_growth_claim(self):
+        mem = {"swap_used_mb": 0.0, "sensors_failed": ["swap (sysctl vm.swapusage)"]}
+        self.assertEqual(mp.check_swap_growth([], mem), [])
+
+    def test_blind_swap_is_stored_as_unknown(self):
+        import time
+        mem = {"total": 8 * 1024 ** 3, "swap_used_mb": 0.0, "swap_total_mb": 0.0,
+               "free_pct": 50, "disk_free": 50 * 1024 ** 3,
+               "sensors_failed": ["swap (sysctl vm.swapusage)"]}
+        t0 = time.time() - 1
+        mp.hist.record(90, mem, [])
+        self.assertEqual([s for s in mp.hist.swap_samples(t0)], [])

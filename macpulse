@@ -54,7 +54,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
 import macpulse_history as hist                            # noqa: E402
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # sysctl, memory_pressure and vm_stat live in /usr/sbin and /usr/bin. launchd agents and
 # AI-assistant hooks start with a minimal PATH, where the scan used to crash on its very
@@ -642,11 +642,21 @@ def _age_text(seconds):
     return f"{h}h {m}m" if h else f"{m}m"
 
 
-def _terminator(pids):
-    """Ask processes to exit (SIGTERM) — the polite counterpart of _killer."""
+def _terminator(pids, cmds=None):
+    """Ask processes to exit (SIGTERM) — the polite counterpart of _killer.
+
+    With cmds ({pid: command line at scan time}) each pid is re-read just before the
+    signal and skipped unless it still runs the same command: a panel left open for an
+    hour must not signal whatever process has since been given a recycled pid.
+    """
     def do(lang):
         asked = 0
         for pid in pids:
+            if cmds is not None:
+                now = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                     capture_output=True, text=True).stdout.strip()
+                if now != (cmds.get(pid) or "").strip():
+                    continue
             try:
                 os.kill(pid, signal.SIGTERM)
                 asked += 1
@@ -1093,6 +1103,7 @@ def check_battery(_procs, mem):
 # --- 10a. Idle AI sessions -----------------------------------------------------------
 
 IDLE_MIN_AGE_S = 12 * 3600
+IDLE_MAX_CPU_NOW = 1.0       # % of a core at scan time
 IDLE_MAX_CPU_SHARE = 0.005          # lifetime cpu time / elapsed, i.e. 0.5 %
 
 
@@ -1121,9 +1132,21 @@ def idle_sessions(procs, own_pids):
     me = getpass.getuser()
     own = set(own_pids or ())
     return [p for p in procs
-            if p.user == me and AI_HOSTS[0][1].search(p.cmd) and not PROTECTED.search(p.cmd)
+            if p.user == me and _is_claude_binary(p) and not PROTECTED.search(p.cmd)
             and p.pid not in own and p.elapsed >= IDLE_MIN_AGE_S
-            and p.cputime / max(p.elapsed, 1) < IDLE_MAX_CPU_SHARE]
+            and p.cputime / max(p.elapsed, 1) < IDLE_MAX_CPU_SHARE
+            # quiet over its lifetime is not enough: a session busy right now is in use
+            and p.cpu < IDLE_MAX_CPU_NOW]
+
+
+def _is_claude_binary(p):
+    """The process IS the Claude Code CLI — not an editor or shell holding a path that
+    ends in /claude (the refuter matched `vim .../claude` with the looser pattern)."""
+    try:
+        exe = p.resolve_exe()[0] or ""
+    except Exception:
+        exe = (p.cmd.split() or [""])[0]
+    return os.path.basename(exe) == "claude" or "native-binary/claude" in exe
 
 
 def check_idle_sessions(procs, _mem):
@@ -1139,7 +1162,8 @@ def check_idle_sessions(procs, _mem):
     return [Finding(
         "warn", "ai:idle", CAT_AI, "idle.t", "idle.d",
         {"n": len(idle), "size": mb(cost)}, cost_kb=cost,
-        fix=_terminator([p.pid for p in idle]), fix_key="fix.stop.term",
+        fix=_terminator([p.pid for p in idle], {p.pid: p.cmd for p in idle}),
+        fix_key="fix.stop.term",
         fix_params={"n": len(idle)}, evidence=rows[:10], auto_fix=False,
         extra={"sessions": [{"pid": p.pid, "age_hours": round(p.elapsed / 3600, 1),
                              "cpu_share": round(p.cputime / max(p.elapsed, 1), 5)}
@@ -1173,6 +1197,8 @@ def swap_growth(samples, now):
 
 
 def check_swap_growth(_procs, mem):
+    if any(str(x).startswith("swap") for x in (mem.get("sensors_failed") or [])):
+        return []                               # no reading this scan, so no growth claim
     now = time.time()
     # hist.record stores this scan's sample only AFTER the checks run, so the reading in
     # hand is added here as the newest point — otherwise a scan could never see itself.
