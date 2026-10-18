@@ -54,7 +54,7 @@ RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 ok "macOS $MACOS · $ARCH · ${RAM_GB} GB RAM · $("$PY" -V 2>&1)"
 
 # ---------------------------------------------------------------- fetch
-# The two program files sit next to this script. When piped from curl, $0 is "bash",
+# The program files sit next to this script. When piped from curl, $0 is "bash",
 # so fall back to downloading them from the same base URL the installer came from.
 BASE="${MACPULSE_BASE:-https://raw.githubusercontent.com/AlimAlirzayev/macpulse/main}"
 SRC_DIR=""
@@ -66,10 +66,11 @@ fi
 mkdir -p "$BIN" "$APPDIR"
 
 if [ -n "$SRC_DIR" ]; then
-  cp "$SRC_DIR/macpulse" "$SRC_DIR/macpulse_strings.py" "$SRC_DIR/macpulse_history.py" "$BIN/"
+  cp "$SRC_DIR/macpulse" "$SRC_DIR/macpulse_strings.py" "$SRC_DIR/macpulse_history.py" \
+     "$SRC_DIR/macpulse_doctor.py" "$SRC_DIR/macpulse_mcp.py" "$BIN/"
   ok "installed from $SRC_DIR"
 elif [ -n "$BASE" ]; then
-  for f in macpulse macpulse_strings.py macpulse_history.py; do
+  for f in macpulse macpulse_strings.py macpulse_history.py macpulse_doctor.py macpulse_mcp.py; do
     curl -fsSL "$BASE/$f" -o "$BIN/$f" || die "could not download $f from $BASE"
   done
   ok "downloaded from $BASE"
@@ -93,8 +94,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>macpulse</string>
   <key>CFBundleDisplayName</key><string>macpulse</string>
   <key>CFBundleIdentifier</key><string>io.macpulse.app</string>
-  <key>CFBundleVersion</key><string>1.3.0</string>
-  <key>CFBundleShortVersionString</key><string>1.3.0</string>
+  <key>CFBundleVersion</key><string>1.4.0</string>
+  <key>CFBundleShortVersionString</key><string>1.4.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>macpulse</string>
   <key>CFBundleIconFile</key><string>macpulse</string>
@@ -140,7 +141,7 @@ fi
 chmod +x "$APP/Contents/MacOS/macpulse"
 
 # The icon is drawn here rather than downloaded, so the install has no binary assets
-# to verify and works even if only the two scripts made it across.
+# to verify and works even if only the scripts made it across.
 "$PY" - "$APP/Contents/Resources/icon.png" <<'PYICON'
 import math, pathlib, struct, sys, zlib
 N=512; BG=(0x0B,0x1B,0x21),(0x05,0x0F,0x13); TEAL=(0x35,0xD6,0xC8)
@@ -226,7 +227,14 @@ if [ "$MENUBAR_OK" -eq 1 ]; then
 </plist>
 PLIST
   launchctl bootout "gui/$(id -u)/io.macpulse.agent" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+  # bootout returns before launchd has finished tearing the old job down, and a
+  # bootstrap issued in that window fails with "Input/output error". An upgrade then
+  # leaves the menu bar watcher dead (measured on 1.3 -> 1.4), so retry briefly.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null && break
+    launchctl print "gui/$(id -u)/io.macpulse.agent" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
   # Check rather than assume: a malformed plist, or a background item the user has not
   # allowed under System Settings > General > Login Items, leaves nothing loaded.
   if launchctl print "gui/$(id -u)/io.macpulse.agent" >/dev/null 2>&1; then

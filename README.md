@@ -49,13 +49,66 @@ each finding.
 ```
 macpulse                 # scan, score out of 100, ranked findings
 macpulse --ui            # open the panel
-macpulse --report        # write an HTML report to the Desktop
+macpulse --report        # write an HTML report (see 'Report location' below)
 macpulse --fix           # offer each fix one at a time
 macpulse --fix --yes     # apply every safe fix without asking
 macpulse --json          # machine-readable
 macpulse --brief         # one line per warning, silent when healthy (for AI assistants)
 macpulse --lang az|en|ru # default follows your system language
+macpulse --exit-status   # exit 0 healthy, 1 warn, 2 critical (for scripts and monitors)
+macpulse --metrics       # Prometheus/OpenMetrics text
+macpulse --doctor        # check macpulse's own installation (add --json for machine output)
+macpulse --mcp           # read-only MCP server on stdio
 ```
+
+Report location: `--report` never writes to the Desktop. It uses `$MACPULSE_REPORT_DIR`
+if set, else `~/Documents/OS-Output` if that folder exists, else `~/Documents/macpulse`.
+
+## What's new in 1.4
+
+- **Explainable score.** `--json` carries `score_breakdown`, a list of
+  `{key, reason, points}`; `100 - sum(points)`, clamped to 0-100, is the score. The
+  terminal report prints a one-line "why this score". Findings with one root cause
+  (swap pressure and per-app memory hogs) share a combined cap of 30 points instead of
+  being counted once each.
+- **Kernel signals.** Memory pressure level (`kern.memorystatus_vm_pressure_level`),
+  thermal throttling (`pmset -g therm`) and battery health (`ioreg AppleSmartBattery`)
+  appear under `memory` in `--json`. Throttling or a battery below 80% capacity raises a
+  warning; a healthy or absent battery stays silent.
+- **Check coverage.** `--json` has `checks: {run, failed}`: a check that raises is
+  listed, not silently dropped.
+- **`--exit-status`.** Nagios convention: 0 no warn/critical, 1 worst is warn,
+  2 worst is critical. Without the flag every mode still exits 0, so the SessionStart
+  `--brief` hook behaves as before.
+- **`--metrics`.** `macpulse_score`, `macpulse_swap_used_bytes`,
+  `macpulse_memory_pressure_level` and `macpulse_findings{severity=...}` with `# HELP` /
+  `# TYPE` lines, terminated by `# EOF`. It prints text on demand; there is no exporter
+  daemon, so point a textfile collector or cron job at it.
+- **`--doctor`.** One OK/WARN/FAIL line per check: CLI version against the app bundle,
+  the `io.macpulse.agent` LaunchAgent loaded with a live pid, history DB
+  `PRAGMA integrity_check`, installed files against the repo copies, and the
+  `macpulse --brief` hook in `~/.claude/settings.json`. Exit 1 only on FAIL.
+- **`--mcp`.** A minimal MCP server (newline-delimited JSON-RPC over stdio) with two
+  read-only tools, `scan` and `explain_score`. No tool can fix, quit, kill or delete
+  anything, and nothing registers it for you. Optional, if you want Claude Code to call it:
+
+  ```
+  claude mcp add macpulse -- ~/.local/bin/macpulse --mcp
+  ```
+
+- **AI session age.** The Claude Code finding shows how long each session has been up.
+
+### Tests
+
+```
+python3 -m unittest discover -s tests
+```
+
+Offline, stdlib only, a couple of seconds. They exercise pure functions on fixtures
+(including a replay of the incident this tool was built after: 8 GB RAM, 8.4 GB of swap,
+306 MB of disk free) and drive the MCP server in-process. They do not run a live scan,
+so they cannot catch a regression that only shows up against a real machine's
+`vm_stat` or `ps` output.
 
 ## Languages
 
@@ -64,6 +117,10 @@ Azerbaijani · English · Russian. Adding one means adding one dictionary to
 renders them at the end.
 
 ## What it will not do
+
+The MCP server and metrics output are deliberately small: no authentication, no
+network listener, no write tools. The thermal and battery readings depend on what
+`pmset` and `ioreg` report on your hardware and may be empty on some Macs.
 
 It will not claim to turn an 8 GB Mac into a 16 GB one. It does not touch your files or
 your disk. It reads the process table, `vm_stat`, swap, and a handful of lock files —

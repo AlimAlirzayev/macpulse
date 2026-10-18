@@ -29,6 +29,10 @@ Usage:
   macpulse --json          machine-readable output
   macpulse --brief         one line per warning, silent when healthy
   macpulse --lang az|en|ru force a language (default: follow the system)
+  macpulse --exit-status   exit 0 healthy, 1 warning, 2 critical, 3 partly blind scan
+  macpulse --metrics       Prometheus/OpenMetrics text (score, swap, pressure, findings)
+  macpulse --doctor        check macpulse's own installation (add --json for machine output)
+  macpulse --mcp           serve a read-only MCP server over stdio (scan, explain_score)
 """
 
 import argparse
@@ -49,7 +53,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
 import macpulse_history as hist                            # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # sysctl, memory_pressure and vm_stat live in /usr/sbin and /usr/bin. launchd agents and
 # AI-assistant hooks start with a minimal PATH, where the scan used to crash on its very
@@ -217,9 +221,100 @@ def descendants(procs, root_pid):
     return out
 
 
+def _cmd(args, timeout=8):
+    """stdout of a command, or "" when it is missing, slow or fails.
+
+    Every signal below comes from a system command that may be absent (a Mac without a
+    battery has no AppleSmartBattery), garbled, or not on PATH. Nothing about a missing
+    signal may crash a scan: callers get an empty string and report None.
+    """
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout).stdout or ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
+def parse_pressure_level(value):
+    """sysctl kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical."""
+    try:
+        return {1: "normal", 2: "warn", 4: "critical"}.get(int(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_pmset_therm(text):
+    """`pmset -g therm` -> {"speed_limit": int|None, "throttled": bool}.
+
+    CPU_Speed_Limit appears only after macOS has recorded a limit; a Mac that never
+    throttled prints "No CPU power status has been recorded" and no number at all.
+    """
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", text or "")
+    limit = int(m.group(1)) if m else None
+    return {"speed_limit": limit, "throttled": limit is not None and limit < 100}
+
+
+def _ioreg_int(text, key):
+    # Top-level properties are printed one per line as `"Key" = value`; the same keys also
+    # appear squeezed inside the BatteryData blob, so the line-anchored form wins.
+    m = (re.search(r'^\s*"%s"\s*=\s*(\d+)\s*$' % key, text, re.M)
+         or re.search(r'"%s"\s*=\s*(\d+)' % key, text))
+    return int(m.group(1)) if m else None
+
+
+def parse_battery(text):
+    """`ioreg -rn AppleSmartBattery` -> {"present","cycle_count","capacity_pct","condition"}.
+
+    On Apple silicon `MaxCapacity` is already a percentage (100), not milliamp-hours, and
+    says nothing about wear. Real health is the raw maximum over the design capacity.
+    """
+    out = {"present": False, "cycle_count": None, "capacity_pct": None, "condition": None}
+    text = text or ""
+    if not text.strip():
+        return out
+    cycles = _ioreg_int(text, "CycleCount")
+    design = _ioreg_int(text, "DesignCapacity")
+    cap = None
+    if design:
+        for key in ("AppleRawMaxCapacity", "NominalChargeCapacity"):
+            raw = _ioreg_int(text, key)
+            if raw:
+                cap = round(raw / design * 100)
+                break
+    if cap is None:
+        mx = _ioreg_int(text, "MaxCapacity")
+        if mx is not None and mx <= 100:
+            cap = mx
+        elif mx and design:
+            cap = round(mx / design * 100)
+    if cap is not None:
+        cap = max(0, min(100, cap))
+    installed = re.search(r'"BatteryInstalled"\s*=\s*(\w+)', text)
+    out["present"] = bool((installed and installed.group(1).lower() == "yes")
+                          or cycles is not None or cap is not None)
+    out["cycle_count"] = cycles
+    out["capacity_pct"] = cap
+    m = re.search(r'"Condition"\s*=\s*"([^"]+)"', text)
+    if m:
+        out["condition"] = m.group(1)
+    elif out["present"] and cap is not None:
+        failed = _ioreg_int(text, "PermanentFailureStatus")
+        out["condition"] = ("Permanent failure" if failed
+                            else "Service recommended" if cap < 80 else "Normal")
+    return out
+
+
+def _num(text, pattern, default=0.0):
+    m = re.search(pattern, text or "")
+    try:
+        return float(m.group(1)) if m else default
+    except ValueError:
+        return default
+
+
 def memory():
     global PAGE
-    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    vm = _cmd(["vm_stat"])
     m = re.search(r"page size of (\d+)", vm)
     if m:
         PAGE = int(m.group(1))
@@ -232,19 +327,30 @@ def memory():
         if v.isdigit():
             stat[k.strip()] = int(v) * PAGE
 
-    sw = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
-    used = float(re.search(r"used\s*=\s*([\d.]+)M", sw).group(1)) if "used" in sw else 0.0
-    total = float(re.search(r"total\s*=\s*([\d.]+)M", sw).group(1)) if "total" in sw else 0.0
+    sw = _cmd(["sysctl", "-n", "vm.swapusage"])
+    # A sensor that gives no reading must not read as "0 GB swap, all fine": the
+    # refuter showed a broken sysctl reported as a healthy Mac. Record it instead.
+    blind = [] if "used" in (sw or "") else ["swap (sysctl vm.swapusage)"]
+    used = _num(sw, r"used\s*=\s*([\d.]+)M")
+    total = _num(sw, r"total\s*=\s*([\d.]+)M")
 
-    total_ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
-                                   capture_output=True, text=True).stdout or 0)
+    total_ram = 0
+    try:
+        total_ram = int(_cmd(["sysctl", "-n", "hw.memsize"]).strip() or 0)
+    except ValueError:
+        pass
+    if not total_ram:
+        try:
+            total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            total_ram = 0
     free_pct = 0
-    mp = subprocess.run(["memory_pressure"], capture_output=True, text=True).stdout
+    mp = _cmd(["memory_pressure"])
     m = re.search(r"free percentage:\s*(\d+)", mp)
     if m:
         free_pct = int(m.group(1))
 
-    boot = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+    boot = _cmd(["sysctl", "-n", "kern.boottime"])
     m = re.search(r"sec\s*=\s*(\d+)", boot)
     uptime_days = (time.time() - int(m.group(1))) / 86400 if m else 0
 
@@ -267,6 +373,12 @@ def memory():
         "uptime_days": uptime_days,
         "disk_free": st.f_bavail * st.f_frsize,
         "disk_total": st.f_blocks * st.f_frsize,
+        "sensors_failed": blind,
+        # Honest signals (1.4): what the kernel itself says, not what we infer from it.
+        "pressure_level": parse_pressure_level(
+            _cmd(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"])),
+        "thermal": parse_pmset_therm(_cmd(["pmset", "-g", "therm"])),
+        "battery": parse_battery(_cmd(["ioreg", "-rn", "AppleSmartBattery"])),
     }
 
 
@@ -484,7 +596,7 @@ class Finding:
 
     def __init__(self, sev, key, category, title_key, detail_key, params,
                  cost_kb=0, core_hours=0.0, fix=None, fix_key=None, fix_params=None,
-                 evidence=None, durable=True):
+                 evidence=None, durable=True, extra=None):
         self.sev = sev              # "critical" | "warn" | "info"
         self.key = key
         self.category = category
@@ -502,6 +614,9 @@ class Finding:
         # its full footprint as "recoverable" would be the same overclaim this tool was
         # built to argue against. Only durable fixes are added up.
         self.durable = durable
+        # Extra machine-readable fields merged into this finding's JSON item (e.g. the
+        # per-session list of an AI-toolchain finding). Never rendered as text.
+        self.extra = extra or {}
 
     def title(self, lang):
         return t(lang, self.title_key, **self.params)
@@ -511,6 +626,15 @@ class Finding:
 
     def fix_label(self, lang):
         return t(lang, self.fix_key, **self.fix_params) if self.fix_key else None
+
+
+def _age_text(seconds):
+    """Compact process age: '3d 4h', '5h 12m', '9m'."""
+    s_ = int(max(0, seconds))
+    d, h, m = s_ // 86400, (s_ % 86400) // 3600, (s_ % 3600) // 60
+    if d:
+        return f"{d}d {h}h"
+    return f"{h}h {m}m" if h else f"{m}m"
 
 
 def _killer(pids):
@@ -623,18 +747,20 @@ def check_ai_toolchain(procs, _mem):
                  if p.user == me and pattern.search(p.cmd) and not PROTECTED.search(p.cmd)]
         if len(hosts) < 2:
             continue
-        total, rows = 0, []
+        total, rows, sessions = 0, [], []
         for h in hosts:
             kids = descendants(procs, h.pid)
             mcp = [k for k in kids if MCP_HINT.search(k.cmd)]
             cost = h.rss + sum(k.rss for k in kids)
             total += cost
-            rows.append(f"PID {h.pid}: {mb(cost)} ({len(mcp)} MCP)")
+            rows.append(f"PID {h.pid}: {mb(cost)} ({len(mcp)} MCP) · up {_age_text(h.elapsed)}")
+            sessions.append({"pid": h.pid, "mb": round(cost / 1024), "mcp": len(mcp),
+                             "age_hours": round(h.elapsed / 3600, 1)})
         sev = "critical" if total > 2 * 1024 * 1024 else ("warn" if len(hosts) > 3 else "info")
         out.append(Finding(
             sev, f"ai:{label}", CAT_AI, "ai.t", "ai.d",
             {"n": len(hosts), "host": label, "size": mb(total), "each": mb(total / len(hosts))},
-            cost_kb=total, evidence=rows[:10],
+            cost_kb=total, evidence=rows[:10], extra={"sessions": sessions},
         ))
 
     # b) A broken MCP server still costs full price, every session.
@@ -822,6 +948,10 @@ def check_memory(_procs, mem):
     if mem["free_pct"] and mem["free_pct"] < 25:
         out.append(Finding("critical", "pressure", CAT_MEMORY, "pressure.t", "pressure.d",
                            {"pct": mem["free_pct"]}))
+    elif mem.get("pressure_level") == "critical":
+        # The kernel's own verdict. Only raised when the free-percentage rule above did
+        # not already fire, so one condition never produces two findings.
+        out.append(Finding("critical", "pressure", CAT_MEMORY, "kpressure.t", "kpressure.d", {}))
     if mem["uptime_days"] > 10 and ratio >= SWAP_WARN_RATIO:
         out.append(Finding("info", "uptime", CAT_MEMORY, "uptime.t", "uptime.d",
                            {"days": f"{mem['uptime_days']:.0f}"}))
@@ -922,20 +1052,81 @@ def check_swarms(procs, _mem):
     return sorted(out, key=lambda f: -f.cost_kb)[:3]
 
 
+# --- 9. Thermal throttling and battery wear ---------------------------------------------
+
+def check_thermal(_procs, mem):
+    th = mem.get("thermal") or {}
+    limit = th.get("speed_limit")
+    if limit is None or limit >= 100:
+        return []
+    return [Finding("warn", "thermal", CAT_PROC, "thermal.t", "thermal.d", {"limit": limit})]
+
+
+def check_battery(_procs, mem):
+    b = mem.get("battery") or {}
+    cap = b.get("capacity_pct")
+    if not b.get("present") or cap is None or cap >= 80:
+        return []
+    return [Finding("warn", "battery", CAT_PROC, "battery.t", "battery.d",
+                    {"pct": cap, "cycles": b.get("cycle_count") if b.get("cycle_count") is not None else "?"})]
+
+
+# --- 10. Orphaned MCP servers --------------------------------------------------------
+
+def check_mcp_orphans(procs, _mem):
+    """MCP servers re-parented to launchd after their AI session died.
+
+    The hint is matched against the launch command only (first 160 chars): GUI helpers
+    such as crashpad handlers carry long argument lists in which "mcp" can appear by
+    chance, and app bundles are never MCP servers.
+
+    A dead assistant session can leave its stdio MCP servers running with PPID 1,
+    holding memory and serving nothing (Claude Code issue 33947). Only processes of this
+    user that have settled for ten minutes count, so a server mid-startup is not flagged.
+    """
+    me = getpass.getuser()
+    mine = [p for p in procs
+            if p.user == me and p.ppid == 1 and p.elapsed >= 600 and p.pid != os.getpid()
+            and MCP_HINT.search(p.cmd[:160]) and ".app/Contents/" not in p.cmd[:160]
+            and not PROTECTED.search(p.cmd) and "macpulse" not in p.cmd[:160]]
+    if not mine:
+        return []
+    cost = sum(p.rss for p in mine)
+    return [Finding(
+        "warn", "mcp.orphans", CAT_AI, "mcporph.t", "mcporph.d",
+        {"n": len(mine), "size": mb(cost)}, cost_kb=cost,
+        fix=_killer([p.pid for p in mine]), fix_key="fix.stop.many",
+        fix_params={"n": len(mine)},
+        evidence=[f"PID {p.pid}: {mb(p.rss)} · {p.cmd[:90]}" for p in mine[:6]],
+    )]
+
+
 CHECKS = [check_cpu_burners, check_ghosts, check_ai_toolchain, check_headless_browsers,
           check_stale_locks, check_idle_heavy, check_memory, check_app_hogs, check_disk, check_disk_forecast,
-          check_swarms]
+          check_swarms, check_thermal, check_battery, check_mcp_orphans]
+
+
+# Coverage of the most recent run_checks(): how many checks ran and which of them raised.
+# A check that fails must be visible in the output, not silently dropped.
+CHECK_STATUS = {"run": 0, "failed": []}
 
 
 def run_checks(procs=None, mem=None, apply_mutes=True):
     procs = procs if procs is not None else processes()
     mem = mem if mem is not None else memory()
     found = []
-    for check in CHECKS:
+    failed = []
+    for check in list(CHECKS):
         try:
             found.extend(check(procs, mem))
         except Exception as exc:          # one bad check must not kill the scan
-            print(f"{S.D}(check {check.__name__} failed: {exc}){S.R}", file=sys.stderr)
+            failed.append(getattr(check, "__name__", str(check)))
+            print(f"{S.D}(check {failed[-1]} failed: {exc}){S.R}", file=sys.stderr)
+    if not procs:                         # ps gave nothing: every process check was blind
+        failed.append("sensor: process table (ps)")
+    failed.extend(f"sensor: {name}" for name in (mem.get("sensors_failed") or []))
+    CHECK_STATUS["run"] = len(CHECKS)
+    CHECK_STATUS["failed"] = failed
     if apply_mutes:
         silenced = hist.muted_keys()
         found = [f for f in found if f.key not in silenced]
@@ -960,13 +1151,47 @@ def rendered(f, lang):
 
 # ------------------------------------------------------------------------- scoring
 
-def score(findings, mem):
-    s = 100
+SEVERITY_POINTS = {"critical": 18, "warn": 8, "info": 0}
+MEMORY_FAMILY_CAP = 30      # swap, memory pressure and per-app hogs are ONE root cause
+
+
+def _memory_family(key):
+    return key == "swap" or key.startswith(("pressure", "hog:"))
+
+
+def score_breakdown(findings, mem, lang="en"):
+    """Every deduction behind the score, as [{"key", "reason", "points"}].
+
+    100 - sum(points), clamped to 0..100, is the score. Swap pressure, the kernel's
+    pressure verdict and a hungry app are one root cause seen three ways; charging each
+    in full made a single bad hour read as three disasters, so together they cost at most
+    MEMORY_FAMILY_CAP points. The rest is charged per finding, as before.
+    """
+    rows, family = [], []
     for f in findings:
-        s -= {"critical": 18, "warn": 8, "info": 0}[f.sev]
-    if mem["free_pct"]:
-        s -= max(0, (30 - mem["free_pct"])) // 2
-    return max(0, min(100, s))
+        pts = SEVERITY_POINTS.get(f.sev, 0)
+        if pts <= 0:
+            continue
+        (family if _memory_family(f.key) else rows).append((f, pts))
+    left = MEMORY_FAMILY_CAP
+    for f, pts in sorted(family, key=lambda fp: -fp[1]):     # biggest deduction first
+        take = min(pts, left)
+        left -= take
+        if take > 0:
+            rows.append((f, take))
+    out = [{"key": f.key, "reason": rendered(f, lang)[0], "points": pts} for f, pts in rows]
+    free = mem.get("free_pct")
+    if free:
+        pts = max(0, (30 - free)) // 2
+        if pts:
+            out.append({"key": "free_pct", "reason": t(lang, "why.freepct", pct=free),
+                        "points": pts})
+    out.sort(key=lambda r: -r["points"])
+    return out
+
+
+def score(findings, mem):
+    return max(0, min(100, 100 - sum(r["points"] for r in score_breakdown(findings, mem))))
 
 
 def grade_key(n):
@@ -992,7 +1217,13 @@ def _wrap(text, width):
     return out
 
 
-def render_terminal(findings, mem, points, lang):
+def _short(text, width=40):
+    """First clause of a finding title, for the one-line score explanation."""
+    head = re.split(r",| — | \(|:", text, maxsplit=1)[0].strip()
+    return head if len(head) <= width else head[:width - 1].rstrip() + "…"
+
+
+def render_terminal(findings, mem, points, lang, breakdown=None):
     colour = grade_colour(points)
     bar_w = 34
     filled = round(points / 100 * bar_w)
@@ -1002,6 +1233,11 @@ def render_terminal(findings, mem, points, lang):
     print(f"  {colour}{S.B}{points}/100 — {t(lang, grade_key(points))}{S.R}   "
           f"{colour}{'█' * filled}{S.D}{'░' * (bar_w - filled)}{S.R}")
     print()
+    if breakdown:
+        top = " · ".join(f"{_short(r['reason'])} −{r['points']}" for r in breakdown[:3])
+        for i, line in enumerate(_wrap(t(lang, "why.line", items=top), 74)):
+            print(f"  {S.D}{line}{S.R}")
+        print()
     print(f"  {S.D}RAM {mem['total'] / GB:.0f} GB · {t(lang, 'ui.free')} {mem['free_pct']}% · "
           f"{t(lang, 'ui.swap')} {mem['swap_used_mb'] / 1024:.1f}/"
           f"{mem['swap_total_mb'] / 1024:.1f} GB · "
@@ -1109,6 +1345,18 @@ body{{background:#000;color:#f5f5f7}} .f{{background:#1c1c1e;border-color:#2c2c2
 </div></body></html>"""
     pathlib.Path(path).write_text(doc)
     return path
+
+
+def report_dir():
+    """Where --report writes. Never the Desktop: that surface belongs to the person."""
+    env = os.environ.get("MACPULSE_REPORT_DIR")
+    if env:
+        d = pathlib.Path(os.path.expanduser(env))
+    else:
+        out_dir = HOME / "Documents" / "OS-Output"
+        d = out_dir if out_dir.is_dir() else HOME / "Documents" / "macpulse"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # ------------------------------------------------------------------------- fixing
@@ -1526,11 +1774,10 @@ def serve_ui(port, default_lang):
     token = secrets.token_urlsafe(18)
     state = {"findings": [], "seen": time.time()}
 
-    def scan_payload(lang):
-        mem = memory()
-        found = run_checks(processes(), mem)
+    def ui_payload(lang):
+        # record=False: the panel rescans on every click and must not flood the history.
+        base, found, mem, points, breakdown = _run_scan(lang, record=False)
         state["findings"] = found
-        points = score(found, mem)
         items = []
         for f in found:
             title, detail = rendered(f, lang)
@@ -1545,6 +1792,7 @@ def serve_ui(port, default_lang):
         return {"version": VERSION, "lang": lang, "strings": bundle(lang),
                 "host": socket.gethostname().replace(".local", ""),
                 "score": points, "grade": t(lang, grade_key(points)), "memory": mem,
+                "score_breakdown": breakdown, "checks": base["checks"],
                 "recoverable_kb": sum(f.cost_kb for f in found if f.fix and f.durable),
                 "trend": hist.trend(),      # the panel draws it; a scan alone cannot
                 "findings": items}
@@ -1580,7 +1828,7 @@ def serve_ui(port, default_lang):
             if path == "/api/scan":
                 if not self._authorised():
                     return self._send(403, '{"error":"bad token"}')
-                return self._send(200, json.dumps(scan_payload(self._lang())))
+                return self._send(200, json.dumps(ui_payload(self._lang())))
             self._send(404, '{"error":"not found"}')
 
         def do_POST(self):
@@ -1636,6 +1884,81 @@ def serve_ui(port, default_lang):
         srv.server_close()
 
 
+# ------------------------------------------------------------------- scan as data
+
+def _run_scan(lang, record=True):
+    """One full scan -> (payload, findings, mem, points, breakdown)."""
+    mem = memory()
+    findings = run_checks(processes(), mem)
+    breakdown = score_breakdown(findings, mem, lang)
+    points = max(0, min(100, 100 - sum(r["points"] for r in breakdown)))
+    ages = hist.record(points, mem, findings) if record else {}
+    checks = {"run": CHECK_STATUS["run"], "failed": list(CHECK_STATUS["failed"])}
+    items = []
+    for f in findings:
+        title, detail = rendered(f, lang)
+        age = ages.get(f.key, {})
+        first = age.get("first_seen")
+        item = {"severity": f.sev, "key": f.key, "category": f.category,
+                "title": title, "detail": detail, "cost_kb": f.cost_kb,
+                "core_hours": round(f.core_hours, 1),
+                "age_days": round((time.time() - first) / 86400, 2) if first else 0,
+                "seen_times": age.get("times", 1),
+                "fixable": bool(f.fix), "evidence": f.evidence}
+        item.update(f.extra)
+        items.append(item)
+    payload = {"version": VERSION, "lang": lang, "score": points,
+               "grade": t(lang, grade_key(points)), "memory": mem,
+               "score_breakdown": breakdown, "checks": checks,
+               "strings": bundle(lang), "trend": hist.trend(), "findings": items}
+    return payload, findings, mem, points, breakdown
+
+
+def scan_payload(lang):
+    """The exact dict `macpulse --json` prints; also what the MCP server returns."""
+    return _run_scan(lang)[0]
+
+
+def metrics_text(payload):
+    """Prometheus text exposition of one scan (also valid OpenMetrics, ends with # EOF)."""
+    mem = payload["memory"]
+    level = {"normal": 1, "warn": 2, "critical": 4}.get(mem.get("pressure_level"), 0)
+    sev = {"critical": 0, "warn": 0, "info": 0}
+    for f in payload["findings"]:
+        sev[f["severity"]] = sev.get(f["severity"], 0) + 1
+    lines = [
+        ("macpulse_score", "Mac health score, 0 (struggling) to 100 (healthy).", payload["score"]),
+        ("macpulse_swap_used_bytes", "Swap in use, in bytes.",
+         int(mem.get("swap_used_mb", 0) * 1048576)),
+        ("macpulse_memory_pressure_level",
+         "Kernel memory pressure: 1 normal, 2 warn, 4 critical, 0 unknown.", level),
+        ("macpulse_disk_free_bytes", "Free space on the data volume, in bytes.",
+         int(mem.get("disk_free", 0))),
+    ]
+    out = []
+    for name, helptext, value in lines:
+        out += [f"# HELP {name} {helptext}", f"# TYPE {name} gauge", f"{name} {value}"]
+    out += ["# HELP macpulse_findings Number of open findings by severity.",
+            "# TYPE macpulse_findings gauge"]
+    out += [f'macpulse_findings{{severity="{k}"}} {sev[k]}' for k in ("critical", "warn", "info")]
+    out.append("# EOF")
+    return "\n".join(out) + "\n"
+
+
+def exit_status(findings, failed=None):
+    """Nagios convention: 0 healthy, 1 worst is a warning, 2 critical, 3 unknown.
+
+    3 is returned only when part of the scan could not measure and nothing worse was
+    found, so a blind scan is never reported to automation as healthy.
+    """
+    worst = {f.sev for f in findings}
+    if "critical" in worst:
+        return 2
+    if "warn" in worst:
+        return 1
+    return 3 if failed else 0
+
+
 # --------------------------------------------------------------------------- main
 
 def main():
@@ -1649,6 +1972,11 @@ def main():
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--brief", action="store_true",
                     help="one line per warning, nothing when healthy (for AI-assistant hooks)")
+    ap.add_argument("--exit-status", action="store_true",
+                    help="exit 0 healthy, 1 worst finding is a warning, 2 critical")
+    ap.add_argument("--metrics", action="store_true", help="Prometheus text, then exit")
+    ap.add_argument("--doctor", action="store_true", help="check macpulse's own installation")
+    ap.add_argument("--mcp", action="store_true", help="serve a read-only MCP server on stdio")
     ap.add_argument("--lang", choices=LANGS, help="force a language (default: system)")
     ap.add_argument("--version", action="version", version=f"macpulse {VERSION}")
     args = ap.parse_args()
@@ -1659,20 +1987,32 @@ def main():
 
     lang = args.lang or detect_lang()
 
+    if args.doctor:
+        import macpulse_doctor                      # lazy: only this mode needs it
+        return macpulse_doctor.run(as_json=args.json, version=VERSION)
+    if args.mcp:
+        import macpulse_mcp
+        return macpulse_mcp.serve(scan_payload, version=VERSION)
+
     if args.ui:
         serve_ui(args.port, lang)
         return 0
 
-    mem = memory()
-    findings = run_checks(processes(), mem)
-    points = score(findings, mem)
-    ages = hist.record(points, mem, findings)
+    payload, findings, mem, points, breakdown = _run_scan(lang)
+    code = exit_status(findings, payload.get("checks", {}).get("failed")) if args.exit_status else 0
+
+    if args.metrics:
+        sys.stdout.write(metrics_text(payload))
+        return code
 
     if args.brief:
         # Read by an AI assistant at the start of every session, so the person does not
         # have to notice the Mac struggling first. Silence means healthy: a hook that
         # always prints something is ignored within a day, like a nagging notification.
         serious = [f for f in findings if f.sev in ("critical", "warn")]
+        blind = payload.get("checks", {}).get("failed") or []
+        if blind:
+            print(f"macpulse: partial scan — could not measure: {', '.join(blind)}")
         if serious:
             print(f"macpulse {points}/100 — Mac needs attention (tell the user, in their language):")
             for f in serious:
@@ -1680,37 +2020,26 @@ def main():
                 print(f"- [{f.sev}] {title}. {detail}")
                 for e in f.evidence[:5]:
                     print(f"    {e}")
-        return 0
+        return code
 
     if args.json:
-        items = []
-        for f in findings:
-            title, detail = rendered(f, lang)
-            age = ages.get(f.key, {})
-            first = age.get("first_seen")
-            items.append({"severity": f.sev, "key": f.key, "category": f.category,
-                          "title": title, "detail": detail, "cost_kb": f.cost_kb,
-                          "core_hours": round(f.core_hours, 1),
-                          "age_days": round((time.time() - first) / 86400, 2) if first else 0,
-                          "seen_times": age.get("times", 1),
-                          "fixable": bool(f.fix), "evidence": f.evidence})
-        print(json.dumps({"version": VERSION, "lang": lang, "score": points,
-                          "grade": t(lang, grade_key(points)), "memory": mem,
-                          "strings": bundle(lang), "trend": hist.trend(),
-                          "findings": items}, indent=2, ensure_ascii=False))
-        return 0
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return code
 
-    render_terminal(findings, mem, points, lang)
+    render_terminal(findings, mem, points, lang, breakdown)
+    blind = payload.get("checks", {}).get("failed") or []
+    if blind:                             # a partly blind score must say so where it is read
+        print(f"  {S.YEL}! partial scan — could not measure: {', '.join(blind)}{S.R}\n")
 
     if args.report:
-        out = HOME / "Desktop" / "macpulse-report.html"
+        out = report_dir() / "macpulse-report.html"
         render_html(findings, mem, points, out, lang)
         print(f"  {S.CYA}{out}{S.R}\n")
         webbrowser.open(f"file://{out}")
 
     if args.fix:
         apply_fixes(findings, args.yes, lang)
-    return 0
+    return code
 
 
 if __name__ == "__main__":

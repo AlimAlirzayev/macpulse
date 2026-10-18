@@ -123,6 +123,16 @@ STRINGS = {
         "swarm.t": "{n} copies of {name} using {size}",
         "swarm.d": "Helper processes are normal for browsers and editors. Listed so you "
                    "can see where the memory actually went, not because it is wrong.",
+        "why.line": "Why this score: {items}",
+        "why.freepct": "low free memory ({pct}%)",
+        "kpressure.t": "The macOS kernel reports critical memory pressure",
+        "kpressure.d": "The system itself rates its memory shortage as critical: it is compressing and pushing data out to disk and everything feels slow. Quit the heaviest app or restart the Mac.",
+        "thermal.t": "The CPU is being throttled to {limit}% speed",
+        "thermal.d": "macOS is deliberately slowing the processor because of heat or a power limit. Let the Mac cool down, check the vents, and look for processes that keep the cores busy.",
+        "battery.t": "Battery capacity is down to {pct}% of original ({cycles} cycles)",
+        "battery.d": "A worn battery drains faster and can limit performance. Below 80% Apple considers a battery due for service.",
+        "mcporph.t": "{n} orphaned MCP server process(es) using {size}",
+        "mcporph.d": "These processes outlived the AI-assistant sessions that started them: their parent is gone and they keep holding memory while serving nothing.",
     },
 
     # --------------------------------------------------------------- Azerbaijani
@@ -240,6 +250,16 @@ STRINGS = {
         "swarm.t": "{name} proqramının {n} nüsxəsi {size} tutur",
         "swarm.d": "Köməkçi proseslər brauzer və redaktorlar üçün normaldır. Səhv olduğu "
                    "üçün yox, yaddaşın hara getdiyini görəsən deyə sadalanıb.",
+        "why.line": "Bu bal niyə: {items}",
+        "why.freepct": "boş yaddaş azdır ({pct}%)",
+        "kpressure.t": "macOS nüvəsi yaddaş təzyiqini kritik elan edir",
+        "kpressure.d": "Sistem özü yaddaş çatışmazlığını kritik qiymətləndirib: məlumatı sıxır və diskə sıxışdırır, hər şey yavaşlayır. Ən ağır proqramı bağlayın və ya Mac-i yenidən başladın.",
+        "thermal.t": "Prosessor məhdudlaşdırılıb: sürət {limit}%-ə endirilib",
+        "thermal.d": "macOS qızma və ya qida məhdudiyyəti səbəbindən prosessoru qəsdən yavaşladır. Mac-in soyumasına imkan verin, havalandırma yerlərini yoxlayın və nüvələri yükləyən prosesləri tapın.",
+        "battery.t": "Batareyanın tutumu ilkin tutumun {pct}%-nə düşüb ({cycles} dövr)",
+        "battery.d": "Köhnəlmiş batareya tez boşalır və performansı məhdudlaşdıra bilər. 80%-dən aşağıda Apple batareyanı dəyişdirilməli sayır.",
+        "mcporph.t": "Yetim MCP server prosesləri: {n} ({size})",
+        "mcporph.d": "Bu proseslər bağlanmış AI sessiyalarından qalıb: valideynləri sona çatıb, onlar isə heç nəyə xidmət etmədən yaddaş tutmağa davam edir.",
     },
 
     # ------------------------------------------------------------------- Russian
@@ -359,6 +379,16 @@ STRINGS = {
         "swarm.d": "Вспомогательные процессы нормальны для браузеров и редакторов. "
                    "Показано, чтобы было видно, куда ушла память, а не потому что это "
                    "ошибка.",
+        "why.line": "Почему такая оценка: {items}",
+        "why.freepct": "мало свободной памяти ({pct}%)",
+        "kpressure.t": "Ядро macOS сообщает о критическом давлении на память",
+        "kpressure.d": "Система сама оценила нехватку памяти как критическую: она сжимает и вытесняет данные на диск, и всё работает медленно. Закройте самое тяжёлое приложение или перезагрузите Mac.",
+        "thermal.t": "Процессор замедлен: скорость снижена до {limit}%",
+        "thermal.d": "macOS намеренно замедляет процессор из-за нагрева или ограничения питания. Дайте Mac остыть, проверьте вентиляционные отверстия и найдите процессы, которые нагружают ядра.",
+        "battery.t": "Ёмкость батареи упала до {pct}% от первоначальной ({cycles} циклов)",
+        "battery.d": "Изношенная батарея быстрее садится и может ограничивать производительность. Ниже 80% Apple считает батарею подлежащей замене.",
+        "mcporph.t": "Осиротевших MCP-серверов: {n} ({size})",
+        "mcporph.d": "Эти процессы остались после закрытых сессий ИИ-ассистента: их родитель завершился, и они продолжают занимать память, ничего не обслуживая.",
     },
 }
 
