@@ -54,7 +54,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
 import macpulse_history as hist                            # noqa: E402
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 # sysctl, memory_pressure and vm_stat live in /usr/sbin and /usr/bin. launchd agents and
 # AI-assistant hooks start with a minimal PATH, where the scan used to crash on its very

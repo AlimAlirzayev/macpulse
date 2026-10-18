@@ -117,8 +117,19 @@ static BOOL IsNumber(id v) { return [v isKindOfClass:NSNumber.class]; }
 // first string call (refuter, round 6). Findings keep only fields of the type the menu
 // uses; a finding that is not a dictionary is dropped.
 static NSDictionary *SanitizePayload(NSDictionary *payload) {
+    NSMutableDictionary *out = [payload mutableCopy];
+    // memory: the menu reads numbers only, so only numbers survive.
+    if ([payload[@"memory"] isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        [(NSDictionary *)payload[@"memory"] enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            if ([v isKindOfClass:NSNumber.class]) m[k] = v;
+        }];
+        out[@"memory"] = m;
+    } else {
+        [out removeObjectForKey:@"memory"];
+    }
     NSArray *raw = [payload[@"findings"] isKindOfClass:NSArray.class] ? payload[@"findings"] : nil;
-    if (!raw) return payload;
+    if (!raw) { [out removeObjectForKey:@"findings"]; return out; }
     NSMutableArray *clean = [NSMutableArray array];
     for (id f in raw) {
         if (![f isKindOfClass:NSDictionary.class]) continue;
@@ -128,7 +139,6 @@ static NSDictionary *SanitizePayload(NSDictionary *payload) {
         if ([f[@"age_days"] isKindOfClass:NSNumber.class]) g[@"age_days"] = f[@"age_days"];
         [clean addObject:g];
     }
-    NSMutableDictionary *out = [payload mutableCopy];
     out[@"findings"] = clean;
     return out;
 }

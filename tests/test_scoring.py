@@ -51,7 +51,7 @@ class _NoDiskWalk:
 
 class IncidentReplay(_NoDiskWalk, unittest.TestCase):
     def test_version(self):
-        self.assertEqual(mp.VERSION, "1.5.2")
+        self.assertEqual(mp.VERSION, "1.5.3")
 
     def test_incident_has_critical_finding(self):
         mem = incident_mem()

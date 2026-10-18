@@ -98,6 +98,10 @@ if set, else `~/Documents/OS-Output` if that folder exists, else `~/Documents/ma
 
 - **AI session age.** The Claude Code finding shows how long each session has been up.
 
+## 1.5.3
+
+- The menu bar agent keeps only numeric `memory` values, so no field of the CLI's JSON can crash it.
+
 ## 1.5.2
 
 - A Claude Code session whose child process (a build, a test run) is busy is no longer treated as idle.
