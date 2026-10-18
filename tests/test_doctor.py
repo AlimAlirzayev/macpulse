@@ -151,6 +151,16 @@ class DoctorChecks(HomeCase):
              "hooks": {"Stop": [{"hooks": [stop]}]}}))
         self.assertEqual(self.status("brief_hook")["status"], "WARN")
 
+    def test_brief_hook_commented_or_wrong_flag_or_disabled(self):
+        s = self.home / ".claude"
+        s.mkdir()
+        for cmd, extra in (("# macpulse --brief", {}), ("macpulse --brief-not", {}),
+                           ("macpulse --brief", {"disableAllHooks": True})):
+            data = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}]}}
+            data.update(extra)
+            (s / "settings.json").write_text(json.dumps(data))
+            self.assertEqual(self.status("brief_hook")["status"], "WARN", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

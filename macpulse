@@ -1194,6 +1194,13 @@ def score(findings, mem):
     return max(0, min(100, 100 - sum(r["points"] for r in score_breakdown(findings, mem))))
 
 
+def grade_key_for(n, findings, failed):
+    """A partly blind scan with nothing serious found cannot claim "Healthy"."""
+    if failed and not any(f.sev in ("critical", "warn") for f in findings):
+        return "grade.partial"
+    return grade_key(n)
+
+
 def grade_key(n):
     return "grade.healthy" if n >= 85 else ("grade.attention" if n >= 65 else "grade.struggling")
 
@@ -1791,7 +1798,9 @@ def serve_ui(port, default_lang):
         # same overclaim the disk cleaners make.
         return {"version": VERSION, "lang": lang, "strings": bundle(lang),
                 "host": socket.gethostname().replace(".local", ""),
-                "score": points, "grade": t(lang, grade_key(points)), "memory": mem,
+                "score": points, "memory": mem,
+                "grade": t(lang, grade_key_for(points, found, base["checks"]["failed"])),
+                "complete": not base["checks"]["failed"],
                 "score_breakdown": breakdown, "checks": base["checks"],
                 "recoverable_kb": sum(f.cost_kb for f in found if f.fix and f.durable),
                 "trend": hist.trend(),      # the panel draws it; a scan alone cannot
@@ -1908,7 +1917,8 @@ def _run_scan(lang, record=True):
         item.update(f.extra)
         items.append(item)
     payload = {"version": VERSION, "lang": lang, "score": points,
-               "grade": t(lang, grade_key(points)), "memory": mem,
+               "grade": t(lang, grade_key_for(points, findings, checks["failed"])),
+               "complete": not checks["failed"], "memory": mem,
                "score_breakdown": breakdown, "checks": checks,
                "strings": bundle(lang), "trend": hist.trend(), "findings": items}
     return payload, findings, mem, points, breakdown

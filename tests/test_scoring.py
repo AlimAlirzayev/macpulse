@@ -248,3 +248,18 @@ class AutomationContract(unittest.TestCase):
             self.assertIn(f"# HELP {name} ", text)
         self.assertIn("macpulse_score 76", text)
         self.assertIn('macpulse_findings{severity="warn"} 1', text)
+
+
+class PointValues(unittest.TestCase):
+    """Exact weights, so a silent change to what a warning costs is caught."""
+
+    def test_warn_costs_8_and_critical_18(self):
+        mem = fixture()
+        self.assertEqual(mp.score([finding("warn", "thermal", mp.CAT_PROC)], mem), 92)
+        self.assertEqual(mp.score([finding("critical", "thermal", mp.CAT_PROC)], mem), 82)
+
+    def test_blind_scan_cannot_be_graded_healthy(self):
+        self.assertEqual(mp.grade_key_for(100, [], ["sensor: process table (ps)"]), "grade.partial")
+        self.assertEqual(mp.grade_key_for(100, [], []), "grade.healthy")
+        self.assertEqual(mp.grade_key_for(92, [finding("warn", "swap")], ["x"]),
+                         mp.grade_key(92))

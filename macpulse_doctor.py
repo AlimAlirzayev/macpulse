@@ -122,11 +122,15 @@ def _brief_hook(version):
         return WARN, "~/.claude/settings.json is not valid JSON"
     # Only a SessionStart hook counts. A text search also matched comments, notes and
     # hooks on other events (found by the refuter), so it reported a hook that never runs.
+    if isinstance(data, dict) and data.get("disableAllHooks") is True:
+        return WARN, "hooks are disabled (disableAllHooks: true)"
     groups = ((data.get("hooks") or {}).get("SessionStart") or []) if isinstance(data, dict) else []
     for group in groups if isinstance(groups, list) else []:
         for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
             cmd = hook.get("command", "") if isinstance(hook, dict) else ""
-            if isinstance(cmd, str) and re.search(r"macpulse[\\\"']*\s+--brief", cmd):
+            # The flag must be exactly --brief, and not inside a shell comment.
+            live = cmd.split("#", 1)[0] if isinstance(cmd, str) else ""
+            if re.search(r"macpulse[\\\"']*\s+--brief(?![\w-])", live):
                 return OK, "SessionStart hook present"
     return WARN, "no SessionStart hook runs 'macpulse --brief'"
 
