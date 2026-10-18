@@ -88,6 +88,47 @@ static BOOL EarlyWarningKey(NSString *key) {
         || [key hasPrefix:@"hog:"] || [key isEqualToString:@"pressure"];
 }
 
+// The CLI is looked up in one place so that tests (and a user with a non-standard
+// install) can point the agent at another build through MACPULSE_BIN.
+static NSString *BinaryPath(void) {
+    const char *env = getenv("MACPULSE_BIN");
+    if (env && env[0]) return [NSString stringWithUTF8String:env];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@".local/bin/macpulse"];
+}
+
+// A scan that could not measure everything must not look like a clean bill of health.
+// `complete` is false when a check raised; a payload from an older CLI has no such key
+// and is treated as complete.
+static BOOL ScanIsComplete(NSDictionary *payload) {
+    id c = payload[@"complete"];
+    return ![c isKindOfClass:NSNumber.class] || [c boolValue];
+}
+
+// The status-item text, as plain characters. Both the live menu bar and --print-title
+// go through this one function, so what the test prints is what the user sees.
+static NSString *TitleForPayload(NSDictionary *payload) {
+    if (![payload isKindOfClass:NSDictionary.class] || !payload[@"score"]) return @"  ?";
+    return [NSString stringWithFormat:@"◍ %ld%@", (long)[payload[@"score"] integerValue],
+            ScanIsComplete(payload) ? @"" : @"?"];
+}
+
+static NSDictionary *RunScan(BOOL loginShell) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
+    task.arguments = @[loginShell ? @"-lc" : @"-c",
+        [NSString stringWithFormat:@"'%@' --json 2>/dev/null", BinaryPath()]];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    NSData *data = nil;
+    if ([task launchAndReturnError:NULL]) {
+        data = [pipe.fileHandleForReading readDataToEndOfFile];
+        [task waitUntilExit];
+    }
+    id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+}
+
 @interface MPAgent : NSObject <NSApplicationDelegate>
 @property (strong) NSStatusItem *item;
 @property (strong) NSTimer *timer;
@@ -100,13 +141,13 @@ static BOOL EarlyWarningKey(NSString *key) {
 @property (assign) BOOL busy;
 @property (assign) BOOL introduced;
 @property (copy) NSString *vitals;
+@property (copy) NSString *partialNote;    // set when the last scan was incomplete
+@property (copy) NSString *topReason;      // the largest score deduction, if reported
 @end
 
 @implementation MPAgent
 
-- (NSString *)binary {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@".local/bin/macpulse"];
-}
+- (NSString *)binary { return BinaryPath(); }
 
 - (NSString *)s:(NSString *)key fallback:(NSString *)fallback {
     NSString *v = self.strings[key];
@@ -165,14 +206,14 @@ static BOOL EarlyWarningKey(NSString *key) {
 }
 
 // The menu bar is a glance, not a dashboard: one coloured pulse glyph and a number.
-- (void)renderTitle:(NSInteger)score {
+- (void)renderTitle:(NSInteger)score complete:(BOOL)complete {
     NSMutableAttributedString *full = [NSMutableAttributedString new];
     [full appendAttributedString:
         [[NSAttributedString alloc] initWithString:@"◍ "
             attributes:@{NSForegroundColorAttributeName: [self colourFor:score],
                          NSFontAttributeName: [NSFont systemFontOfSize:11]}]];
     [full appendAttributedString:
-        [[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%ld", (long)score]
+        [[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%ld%@", (long)score, complete ? @"" : @"?"]
             attributes:@{NSFontAttributeName:
                 [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightMedium]}]];
     self.item.button.attributedTitle = full;
@@ -182,20 +223,7 @@ static BOOL EarlyWarningKey(NSString *key) {
     if (self.busy) return;
     self.busy = YES;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSTask *task = [NSTask new];
-        task.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
-        task.arguments = @[@"-lc",
-            [NSString stringWithFormat:@"'%@' --json 2>/dev/null", [self binary]]];
-        NSPipe *pipe = [NSPipe pipe];
-        task.standardOutput = pipe;
-        task.standardError = [NSFileHandle fileHandleWithNullDevice];
-        NSData *data = nil;
-        if ([task launchAndReturnError:NULL]) {
-            data = [pipe.fileHandleForReading readDataToEndOfFile];
-            [task waitUntilExit];
-        }
-        NSDictionary *payload = data
-            ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        NSDictionary *payload = RunScan(YES);
         dispatch_async(dispatch_get_main_queue(), ^{
             [self apply:payload];
             self.busy = NO;
@@ -225,7 +253,30 @@ static BOOL EarlyWarningKey(NSString *key) {
     NSArray *findings = [payload[@"findings"] isKindOfClass:NSArray.class]
                         ? payload[@"findings"] : @[];
 
-    [self renderTitle:score];
+    BOOL complete = ScanIsComplete(payload);
+    self.partialNote = nil;
+    if (!complete) {
+        NSDictionary *checks = [payload[@"checks"] isKindOfClass:NSDictionary.class]
+                               ? payload[@"checks"] : nil;
+        NSArray *failed = [checks[@"failed"] isKindOfClass:NSArray.class] ? checks[@"failed"] : @[];
+        NSString *names = failed.count ? [failed componentsJoinedByString:@", "] : @"unknown";
+        self.partialNote = [NSString stringWithFormat:
+            @"partial scan — could not measure: %@", names];
+    }
+    self.topReason = nil;
+    NSInteger best = 0;
+    if ([payload[@"score_breakdown"] isKindOfClass:NSArray.class]) {
+        for (NSDictionary *row in payload[@"score_breakdown"]) {
+            if (![row isKindOfClass:NSDictionary.class]) continue;
+            NSInteger pts = [row[@"points"] integerValue];
+            if (pts > best && [row[@"reason"] isKindOfClass:NSString.class]) {
+                best = pts;
+                self.topReason = [NSString stringWithFormat:@"−%ld  %@", (long)pts, row[@"reason"]];
+            }
+        }
+    }
+
+    [self renderTitle:score complete:complete];
     [self buildMenuWithScore:score grade:grade findings:findings];
 
     if (!self.introduced) {
@@ -273,6 +324,16 @@ static BOOL EarlyWarningKey(NSString *key) {
     NSMenuItem *head = [[NSMenuItem alloc] initWithTitle:headText action:nil keyEquivalent:@""];
     head.enabled = NO;
     [menu addItem:head];
+
+    for (NSString *note in @[self.partialNote ?: @"", self.topReason ?: @""]) {
+        if (note.length == 0) continue;
+        NSMenuItem *n = [[NSMenuItem alloc] initWithTitle:note action:nil keyEquivalent:@""];
+        n.enabled = NO;
+        n.attributedTitle = [[NSAttributedString alloc] initWithString:note
+            attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:11],
+                         NSForegroundColorAttributeName: [NSColor secondaryLabelColor]}];
+        [menu addItem:n];
+    }
 
     // The two numbers this tool exists for, where a glance can reach them. Swap says
     // how much memory has spilled onto the disk; free space says how much room is left
@@ -378,8 +439,16 @@ static BOOL EarlyWarningKey(NSString *key) {
 
 @end
 
-int main(void) {
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        // Headless mode for tests and scripts: run the CLI, print the title the status
+        // item would carry, leave. No NSApplication, no status item, no instance lock.
+        if (argc > 1 && strcmp(argv[1], "--print-title") == 0) {
+            NSDictionary *payload = RunScan(NO);
+            NSString *title = TitleForPayload(payload);
+            printf("%s\n", title.UTF8String);
+            return payload ? 0 : 1;
+        }
         if (!AcquireSingleInstanceLock()) {
             // Already running. Ask that instance to show itself, then step aside.
             [[NSDistributedNotificationCenter defaultCenter]

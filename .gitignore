@@ -2,3 +2,4 @@
 macpulse-menubar
 __pycache__/
 *.pyc
+sbom.cdx.json

@@ -58,22 +58,66 @@ ok "macOS $MACOS · $ARCH · ${RAM_GB} GB RAM · $("$PY" -V 2>&1)"
 # so fall back to downloading them from the same base URL the installer came from.
 BASE="${MACPULSE_BASE:-https://raw.githubusercontent.com/AlimAlirzayev/macpulse/main}"
 SRC_DIR=""
-if [ -f "${BASH_SOURCE[0]:-}" ]; then
+# An explicit MACPULSE_BASE means "install from there": it wins over the files that sit
+# next to this script, so the verified download path cannot be bypassed by accident.
+if [ -z "${MACPULSE_BASE:-}" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
   SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   [ -f "$SRC_DIR/macpulse" ] || SRC_DIR=""
 fi
 
-mkdir -p "$BIN" "$APPDIR"
+PROGRAM_FILES="macpulse macpulse_strings.py macpulse_history.py macpulse_doctor.py macpulse_mcp.py"
+STAGE=""
+STAGED_MENUBAR=""
+cleanup() { [ -z "$STAGE" ] || rm -rf "$STAGE"; }
+trap cleanup EXIT
 
 if [ -n "$SRC_DIR" ]; then
-  cp "$SRC_DIR/macpulse" "$SRC_DIR/macpulse_strings.py" "$SRC_DIR/macpulse_history.py" \
-     "$SRC_DIR/macpulse_doctor.py" "$SRC_DIR/macpulse_mcp.py" "$BIN/"
+  # A local copy is held to the same standard when it ships a SHA256SUMS: an unpacked
+  # release with one altered file must not install. A developer tree without the file
+  # (or with MACPULSE_DEV=1 while editing) installs as-is.
+  if [ -f "$SRC_DIR/SHA256SUMS" ] && [ "${MACPULSE_DEV:-0}" != "1" ]; then
+    for f in $PROGRAM_FILES; do
+      awk -v f="$f" '$2 == f || $2 == "*" f' "$SRC_DIR/SHA256SUMS" | grep -q . \
+        || die "$f is not listed in SHA256SUMS — nothing was installed"
+    done
+    (cd "$SRC_DIR" && for f in $PROGRAM_FILES; do
+       awk -v f="$f" '$2 == f || $2 == "*" f' SHA256SUMS; done | shasum -a 256 -c - >/dev/null 2>&1) \
+      || die "checksum mismatch against SHA256SUMS — nothing was installed (run release.sh after editing)"
+    ok "checksums verified (local copy)"
+  fi
+  mkdir -p "$BIN" "$APPDIR"
+  for f in $PROGRAM_FILES; do cp "$SRC_DIR/$f" "$BIN/"; done
   ok "installed from $SRC_DIR"
 elif [ -n "$BASE" ]; then
-  for f in macpulse macpulse_strings.py macpulse_history.py macpulse_doctor.py macpulse_mcp.py; do
-    curl -fsSL "$BASE/$f" -o "$BIN/$f" || die "could not download $f from $BASE"
+  # Verified install: every file is downloaded into a staging directory and checked
+  # against SHA256SUMS BEFORE anything is copied into $HOME. A mismatch, a file missing
+  # from the list, or no SHA256SUMS at all aborts with nothing installed. This protects
+  # against a corrupted or tampered download; it is not a signature (see README).
+  STAGE="$(mktemp -d)"
+  curl -fsSL "$BASE/SHA256SUMS" -o "$STAGE/SHA256SUMS" \
+    || die "could not download SHA256SUMS from $BASE — refusing to install unverified files"
+  for f in $PROGRAM_FILES; do
+    curl -fsSL "$BASE/$f" -o "$STAGE/$f" || die "could not download $f from $BASE"
   done
-  ok "downloaded from $BASE"
+  # The menu bar source is optional (no compiler means no agent), but if it is fetched
+  # it is verified like everything else.
+  if curl -fsSL "$BASE/menubar.m" -o "$STAGE/menubar.m" 2>/dev/null; then
+    STAGED_MENUBAR="$STAGE/menubar.m"
+    VERIFY_FILES="$PROGRAM_FILES menubar.m"
+  else
+    VERIFY_FILES="$PROGRAM_FILES"
+  fi
+  : > "$STAGE/subset"
+  for f in $VERIFY_FILES; do
+    awk -v f="$f" '$2 == f || $2 == "*" f' "$STAGE/SHA256SUMS" | grep . >> "$STAGE/subset" \
+      || die "$f is not listed in SHA256SUMS — nothing was installed"
+  done
+  (cd "$STAGE" && shasum -a 256 -c subset >/dev/null 2>&1) \
+    || die "checksum mismatch against SHA256SUMS — nothing was installed"
+  ok "checksums verified ($(echo $VERIFY_FILES | wc -w | tr -d ' ') files)"
+  mkdir -p "$BIN" "$APPDIR"
+  for f in $PROGRAM_FILES; do cp "$STAGE/$f" "$BIN/$f"; done
+  ok "installed from $BASE"
 else
   die "No source found and MACPULSE_BASE is unset."
 fi
@@ -94,8 +138,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>macpulse</string>
   <key>CFBundleDisplayName</key><string>macpulse</string>
   <key>CFBundleIdentifier</key><string>io.macpulse.app</string>
-  <key>CFBundleVersion</key><string>1.4.0</string>
-  <key>CFBundleShortVersionString</key><string>1.4.0</string>
+  <key>CFBundleVersion</key><string>1.5.0</string>
+  <key>CFBundleShortVersionString</key><string>1.5.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>macpulse</string>
   <key>CFBundleIconFile</key><string>macpulse</string>
@@ -114,9 +158,8 @@ PLIST
 MENUBAR_SRC=""
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/menubar.m" ]; then
   MENUBAR_SRC="$SRC_DIR/menubar.m"
-elif [ -n "$BASE" ]; then
-  TMP_M="$(mktemp -d)/menubar.m"
-  curl -fsSL "$BASE/menubar.m" -o "$TMP_M" 2>/dev/null && MENUBAR_SRC="$TMP_M"
+elif [ -n "$STAGED_MENUBAR" ]; then
+  MENUBAR_SRC="$STAGED_MENUBAR"
 fi
 
 MENUBAR_OK=0

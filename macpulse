@@ -31,6 +31,7 @@ Usage:
   macpulse --lang az|en|ru force a language (default: follow the system)
   macpulse --exit-status   exit 0 healthy, 1 warning, 2 critical, 3 partly blind scan
   macpulse --metrics       Prometheus/OpenMetrics text (score, swap, pressure, findings)
+  macpulse --ui --no-open  serve the panel without a browser; print its tokened URL
   macpulse --doctor        check macpulse's own installation (add --json for machine output)
   macpulse --mcp           serve a read-only MCP server over stdio (scan, explain_score)
 """
@@ -53,7 +54,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
 import macpulse_history as hist                            # noqa: E402
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # sysctl, memory_pressure and vm_stat live in /usr/sbin and /usr/bin. launchd agents and
 # AI-assistant hooks start with a minimal PATH, where the scan used to crash on its very
@@ -596,7 +597,7 @@ class Finding:
 
     def __init__(self, sev, key, category, title_key, detail_key, params,
                  cost_kb=0, core_hours=0.0, fix=None, fix_key=None, fix_params=None,
-                 evidence=None, durable=True, extra=None):
+                 evidence=None, durable=True, extra=None, auto_fix=True):
         self.sev = sev              # "critical" | "warn" | "info"
         self.key = key
         self.category = category
@@ -617,6 +618,10 @@ class Finding:
         # Extra machine-readable fields merged into this finding's JSON item (e.g. the
         # per-session list of an AI-toolchain finding). Never rendered as text.
         self.extra = extra or {}
+        # May `--fix --yes` and the panel's "fix all" apply this without a person looking
+        # at it? False for fixes that end somebody's work (an idle session may still hold
+        # a conversation the person wants): those need an explicit, per-item decision.
+        self.auto_fix = auto_fix
 
     def title(self, lang):
         return t(lang, self.title_key, **self.params)
@@ -635,6 +640,20 @@ def _age_text(seconds):
     if d:
         return f"{d}d {h}h"
     return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _terminator(pids):
+    """Ask processes to exit (SIGTERM) — the polite counterpart of _killer."""
+    def do(lang):
+        asked = 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                asked += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+        return t(lang, "res.asked", done=asked, total=len(pids))
+    return do
 
 
 def _killer(pids):
@@ -1071,6 +1090,103 @@ def check_battery(_procs, mem):
                     {"pct": cap, "cycles": b.get("cycle_count") if b.get("cycle_count") is not None else "?"})]
 
 
+# --- 10a. Idle AI sessions -----------------------------------------------------------
+
+IDLE_MIN_AGE_S = 12 * 3600
+IDLE_MAX_CPU_SHARE = 0.005          # lifetime cpu time / elapsed, i.e. 0.5 %
+
+
+def ancestor_pids(procs, pid=None):
+    """`pid` and every parent above it, according to the process table."""
+    by_pid = {p.pid: p for p in procs}
+    pid = os.getpid() if pid is None else pid
+    chain, guard = {pid}, 0
+    while pid in by_pid and guard < 64:
+        pid = by_pid[pid].ppid
+        if pid in chain or pid <= 0:
+            break
+        chain.add(pid)
+        guard += 1
+    return chain
+
+
+def idle_sessions(procs, own_pids):
+    """Claude Code sessions left open for 12 h+ that have used under 0.5 % of a core.
+
+    A session that did real work in its lifetime has a CPU share well above that; one
+    that sat in a forgotten tab has almost none, yet still carries its whole MCP stack.
+    The session that is running this scan (own_pids: this process and its ancestors) is
+    never selected, however old and quiet it looks.
+    """
+    me = getpass.getuser()
+    own = set(own_pids or ())
+    return [p for p in procs
+            if p.user == me and AI_HOSTS[0][1].search(p.cmd) and not PROTECTED.search(p.cmd)
+            and p.pid not in own and p.elapsed >= IDLE_MIN_AGE_S
+            and p.cputime / max(p.elapsed, 1) < IDLE_MAX_CPU_SHARE]
+
+
+def check_idle_sessions(procs, _mem):
+    idle = idle_sessions(procs, ancestor_pids(procs))
+    if not idle:
+        return []
+    rows, cost = [], 0
+    for h in sorted(idle, key=lambda p: -p.elapsed):
+        c = h.rss + sum(k.rss for k in descendants(procs, h.pid))
+        cost += c
+        rows.append(f"PID {h.pid}: {mb(c)} · up {_age_text(h.elapsed)} · "
+                    f"CPU {h.cputime / max(h.elapsed, 1) * 100:.2f}%")
+    return [Finding(
+        "warn", "ai:idle", CAT_AI, "idle.t", "idle.d",
+        {"n": len(idle), "size": mb(cost)}, cost_kb=cost,
+        fix=_terminator([p.pid for p in idle]), fix_key="fix.stop.term",
+        fix_params={"n": len(idle)}, evidence=rows[:10], auto_fix=False,
+        extra={"sessions": [{"pid": p.pid, "age_hours": round(p.elapsed / 3600, 1),
+                             "cpu_share": round(p.cputime / max(p.elapsed, 1), 5)}
+                            for p in idle]},
+    )]
+
+
+# --- 10b. Swap that keeps growing ----------------------------------------------------
+
+SWAP_GROWTH_WINDOW_S = 30 * 60
+SWAP_GROWTH_GB = 1.0
+
+
+def swap_growth(samples, now):
+    """[(ts, swap_used_gb), ...] -> {"delta_gb", "minutes"} or None.
+
+    Compares the newest sample in the last 30 minutes with the smallest earlier one in
+    the same window. The level can sit high for days without being a problem; a climb of
+    a gigabyte inside half an hour is a leak or a runaway app happening right now.
+    """
+    win = sorted((ts, gb) for ts, gb in samples
+                 if gb is not None and now - SWAP_GROWTH_WINDOW_S <= ts <= now)
+    if len(win) < 2:
+        return None
+    last_ts, last_gb = win[-1]
+    base_ts, base_gb = min(win[:-1], key=lambda s_: (s_[1], s_[0]))
+    delta = last_gb - base_gb
+    if delta < SWAP_GROWTH_GB:
+        return None
+    return {"delta_gb": round(delta, 2), "minutes": round((last_ts - base_ts) / 60, 2)}
+
+
+def check_swap_growth(_procs, mem):
+    now = time.time()
+    # hist.record stores this scan's sample only AFTER the checks run, so the reading in
+    # hand is added here as the newest point — otherwise a scan could never see itself.
+    samples = list(hist.swap_samples(now - SWAP_GROWTH_WINDOW_S))
+    samples.append((now, mem.get("swap_used_mb", 0) / 1024))
+    g = swap_growth(samples, now)
+    if not g:
+        return []
+    return [Finding("warn", "swap.growth", CAT_MEMORY, "swapgrow.t", "swapgrow.d",
+                    {"delta": f"{g['delta_gb']:.1f}", "minutes": f"{g['minutes']:.0f}",
+                     "used": f"{mem.get('swap_used_mb', 0) / 1024:.1f}"},
+                    extra={"growth": g})]
+
+
 # --- 10. Orphaned MCP servers --------------------------------------------------------
 
 def check_mcp_orphans(procs, _mem):
@@ -1103,7 +1219,8 @@ def check_mcp_orphans(procs, _mem):
 
 CHECKS = [check_cpu_burners, check_ghosts, check_ai_toolchain, check_headless_browsers,
           check_stale_locks, check_idle_heavy, check_memory, check_app_hogs, check_disk, check_disk_forecast,
-          check_swarms, check_thermal, check_battery, check_mcp_orphans]
+          check_swarms, check_thermal, check_battery, check_mcp_orphans,
+          check_idle_sessions, check_swap_growth]
 
 
 # Coverage of the most recent run_checks(): how many checks ran and which of them raised.
@@ -1156,7 +1273,7 @@ MEMORY_FAMILY_CAP = 30      # swap, memory pressure and per-app hogs are ONE roo
 
 
 def _memory_family(key):
-    return key == "swap" or key.startswith(("pressure", "hog:"))
+    return key.startswith(("swap", "pressure", "hog:"))
 
 
 def score_breakdown(findings, mem, lang="en"):
@@ -1291,7 +1408,10 @@ def render_terminal(findings, mem, points, lang, breakdown=None):
         print(f"  {S.B}{len(fixable)}/{len(findings)}{S.R} → macpulse --fix\n")
 
 
-def render_html(findings, mem, points, path, lang):
+def render_html(findings, mem, points, path, lang, breakdown=None):
+    if breakdown is None:
+        breakdown = score_breakdown(findings, mem, lang)
+    failed = CHECK_STATUS["failed"]
     sev_order = {"critical": 0, "warn": 1, "info": 2}
     rows = []
     for f in sorted(findings, key=lambda x: sev_order[x.sev]):
@@ -1312,6 +1432,14 @@ def render_html(findings, mem, points, path, lang):
           <div class="tags">{"".join(chips)}</div>
         </article>""")
 
+    why_rows = "".join(
+        f"<li data-key=\"{html.escape(r['key'])}\"><span>{html.escape(r['reason'])}</span>"
+        f"<b>−{r['points']}</b></li>"
+        for r in breakdown) or f"<li><span>{html.escape(t(lang, 'ui.why.none'))}</span></li>"
+    why_note = (f"<p class='meta'>{html.escape(t(lang, 'ui.why.partial', list=', '.join(failed)))}</p>"
+                if failed else "")
+    why = (f"<section id='why' class='why'><h2>{html.escape(t(lang, 'ui.why'))}</h2>"
+           f"<ul>{why_rows}</ul>{why_note}</section>")
     # Only what pressing Fix would really free — same rule as the app.
     reclaim = sum(f.cost_kb for f in findings if f.fix and f.durable)
     colour = "#30d158" if points >= 85 else "#ff9f0a" if points >= 65 else "#ff453a"
@@ -1340,14 +1468,22 @@ font-family:ui-monospace,Menlo,monospace;word-break:break-all}}
 .tags{{margin-top:11px;display:flex;gap:7px;flex-wrap:wrap}}
 .tag{{font-size:11.5px;padding:3px 9px;border-radius:99px;background:#f2f2f7;color:#6e6e73}}
 .tag.fix{{background:#e8f5e9;color:#1b5e20}}
+.why{{background:#fff;border:1px solid #e8e8ed;border-radius:14px;padding:16px 20px;margin-bottom:22px}}
+.why h2{{font-size:15px;margin:0 0 8px}}
+.why ul{{list-style:none;margin:0;padding:0}}
+.why li{{display:flex;justify-content:space-between;gap:16px;padding:5px 0;font-size:14px;
+border-top:1px solid #f0f0f3}} .why li:first-child{{border-top:0}}
+.why b{{font-variant-numeric:tabular-nums;color:#bf2b23}}
 @media (prefers-color-scheme:dark){{
-body{{background:#000;color:#f5f5f7}} .f{{background:#1c1c1e;border-color:#2c2c2e}}
+body{{background:#000;color:#f5f5f7}} .f,.why{{background:#1c1c1e;border-color:#2c2c2e}}
+.why li{{border-color:#2c2c2e}} .why b{{color:#ff6961}}
 .f p{{color:#aeaeb2}} .bar{{background:#2c2c2e}} .tag{{background:#2c2c2e;color:#aeaeb2}}
 .tag.fix{{background:#0f3d1a;color:#7ee39a}}}}
 </style></head><body><div class="wrap">
 <h1>macpulse</h1><p class="sub">{html.escape(t(lang, 'app.tagline'))} · {time.strftime('%d.%m.%Y %H:%M')}</p>
 <div class="score"><b>{points}</b><span>/100 — {html.escape(t(lang, grade_key_for(points, findings, CHECK_STATUS["failed"])))}</span></div>
 <div class="bar"><i></i></div>
+{why}
 <p class="meta">{mem['total'] / GB:.0f} GB RAM · {mem['free_pct']}% ·
 {mem['swap_used_mb'] / 1024:.1f}/{mem['swap_total_mb'] / 1024:.1f} GB ·
 {mem['uptime_days']:.0f} {html.escape(t(lang, 'ui.days'))}
@@ -1378,6 +1514,12 @@ def apply_fixes(findings, assume_yes, lang):
         print(f"  {S.GRN}{t(lang, 'ui.nofix')}{S.R}\n")
         return
     done = 0
+    if assume_yes:
+        # --yes means nobody is looking: only fixes that cannot cost anyone their work.
+        for f in [x for x in fixable if not x.auto_fix]:
+            print(f"  {S.B}{rendered(f, lang)[0]}{S.R}")
+            print(f"    {S.YEL}{t(lang, 'fix.manualonly')}{S.R}\n")
+        fixable = [f for f in fixable if f.auto_fix]
     for f in fixable:
         print(f"  {S.B}{rendered(f, lang)[0]}{S.R}")
         print(f"    {S.MAG}{f.fix_label(lang)}{S.R}")
@@ -1570,6 +1712,7 @@ button:focus-visible,nav button:focus-visible{outline:2px solid var(--tint);outl
       <button id="fixall" class="primary" disabled></button>
     </div>
     <div class="pane" id="pane"></div>
+    <div class="pane" id="why"></div>
   </div>
 </div>
 <div id="toast" role="status" aria-live="polite"></div>
@@ -1668,7 +1811,7 @@ function paint(){
       localStorage.setItem("macpulse.lang",LANG);scan();}));
 
   $("#paneTitle").textContent = T("nav."+PANE,PANE);
-  const fixable = D.findings.filter(f=>f.fixable);
+  const fixable = D.findings.filter(f=>f.fixable && f.auto_fix!==false);
   $("#fixall").textContent = fixable.length
     ? T("btn.fixall.n","Fix all ({n})").replace("{n}",fixable.length)
     : T("btn.fixall","Fix all safe");
@@ -1707,6 +1850,17 @@ function paint(){
       : `<div class="group"><div class="empty">${esc(T("ui.nothing.section",""))}</div></div>`;
   }
   $("#pane").innerHTML = h;
+  // Why this score: every deduction, plus what could not be measured on a partial scan.
+  const bd = D.score_breakdown || [];
+  let w = `<p class="grouphead">${esc(T("ui.why","Why this score"))} · ${esc(D.grade)}</p><div class="group">`;
+  w += bd.length ? bd.map(r=>`<div class="row"><div class="txt"><b>${esc(r.reason)}</b></div>
+      <span class="val">−${r.points}</span></div>`).join("")
+    : `<div class="row"><div class="txt"><b>${esc(T("ui.why.none",""))}</b></div></div>`;
+  if(D.complete === false){
+    w += `<div class="row"><div class="txt"><b>${esc(T("ui.why.partial","").replace("{list}",
+      ((D.checks&&D.checks.failed)||[]).join(", ")))}</b></div></div>`;
+  }
+  $("#why").innerHTML = w + `</div>`;
   document.querySelectorAll("button.act").forEach(b=>
     b.addEventListener("click",()=>runFix(b.dataset.key,b)));
 }
@@ -1740,7 +1894,7 @@ async function runFix(key,btn){
 
 $("#rescan").addEventListener("click",scan);
 $("#fixall").addEventListener("click",async()=>{
-  const list = D.findings.filter(f=>f.fixable);
+  const list = D.findings.filter(f=>f.fixable && f.auto_fix!==false);
   const summary = list.map(f=>"• "+f.fix_label).join("\n");
   if(!confirm(T("ui.confirm","Apply these fixes?")+"\n\n"+summary)) return;
   const keys = list.map(f=>f.key);
@@ -1749,7 +1903,7 @@ $("#fixall").addEventListener("click",async()=>{
   for(const k of keys){
     try{
       const r = await fetch("/api/fix?k="+encodeURIComponent(TOKEN)+(LANG?"&lang="+LANG:""),
-        {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});
+        {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k,all:true})});
       if((await r.json()).ok) n++;
     }catch(e){ /* keep going; the rescan below reports the real state */ }
   }
@@ -1769,7 +1923,7 @@ scan();
 </script></body></html>"""
 
 
-def serve_ui(port, default_lang):
+def serve_ui(port, default_lang, open_browser=True):
     """Serve the app on loopback only, gated by a token minted at startup.
 
     This service can terminate processes. A bare localhost port would let any page
@@ -1795,6 +1949,7 @@ def serve_ui(port, default_lang):
             items.append({"severity": f.sev, "key": f.key, "category": f.category,
                           "title": title, "detail": detail, "cost_kb": f.cost_kb,
                           "core_hours": round(f.core_hours, 1), "fixable": bool(f.fix),
+                          "auto_fix": f.auto_fix,
                           "fix_label": f.fix_label(lang), "evidence": f.evidence[:3]})
         # "Recoverable" must mean what pressing Fix would actually give back. Summing
         # every finding's cost inflates it with things we only report — 26 Chrome
@@ -1858,12 +2013,17 @@ def serve_ui(port, default_lang):
                 return
             try:
                 n = int(self.headers.get("Content-Length", 0))
-                key = json.loads(self.rfile.read(n) or b"{}").get("key")
-            except (ValueError, TypeError):
+                body = json.loads(self.rfile.read(n) or b"{}")
+                key, bulk = body.get("key"), bool(body.get("all"))
+            except (ValueError, TypeError, AttributeError):
                 return self._send(400, '{"error":"bad request"}')
             target = next((f for f in state["findings"] if f.key == key and f.fix), None)
             if not target:
                 return self._send(404, '{"error":"stale — rescan first"}')
+            if bulk and not target.auto_fix:
+                # "Fix all" never ends a session on its own; only a per-item press does.
+                return self._send(200, json.dumps(
+                    {"ok": False, "skipped": True, "error": t(self._lang(), "fix.manualonly")}))
             try:
                 return self._send(200, json.dumps({"ok": True, "result": target.fix(self._lang())}))
             except Exception as exc:
@@ -1886,9 +2046,12 @@ def serve_ui(port, default_lang):
         threading.Thread(target=reaper, daemon=True).start()
 
     url = f"http://127.0.0.1:{srv.server_address[1]}/?k={token}"
-    print(f"\n  {S.B}macpulse{S.R} → {S.CYA}{url}{S.R}", flush=True)
-    print(f"  {S.D}loopback only · Ctrl-C to quit{S.R}\n", flush=True)
-    webbrowser.open(url)
+    if open_browser:
+        print(f"\n  {S.B}macpulse{S.R} → {S.CYA}{url}{S.R}", flush=True)
+        print(f"  {S.D}loopback only · Ctrl-C to quit{S.R}\n", flush=True)
+        webbrowser.open(url)
+    else:
+        print(url, flush=True)            # one plain line: scripts read the URL from it
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1917,7 +2080,7 @@ def _run_scan(lang, record=True):
                 "core_hours": round(f.core_hours, 1),
                 "age_days": round((time.time() - first) / 86400, 2) if first else 0,
                 "seen_times": age.get("times", 1),
-                "fixable": bool(f.fix), "evidence": f.evidence}
+                "fixable": bool(f.fix), "auto_fix": f.auto_fix, "evidence": f.evidence}
         item.update(f.extra)
         items.append(item)
     payload = {"version": VERSION, "lang": lang, "score": points,
@@ -1980,6 +2143,8 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ui", action="store_true", help="open the app window")
     ap.add_argument("--port", type=int, default=0, help="with --ui, a fixed port")
+    ap.add_argument("--no-open", action="store_true",
+                    help="with --ui, do not open a browser; print the panel URL")
     ap.add_argument("--fix", action="store_true", help="offer to apply each fix")
     ap.add_argument("--yes", "-y", action="store_true", help="with --fix, do not ask")
     ap.add_argument("--report", action="store_true", help="write an HTML report and open it")
@@ -2009,7 +2174,7 @@ def main():
         return macpulse_mcp.serve(scan_payload, version=VERSION)
 
     if args.ui:
-        serve_ui(args.port, lang)
+        serve_ui(args.port, lang, open_browser=not args.no_open)
         return 0
 
     payload, findings, mem, points, breakdown = _run_scan(lang)
@@ -2047,7 +2212,7 @@ def main():
 
     if args.report:
         out = report_dir() / "macpulse-report.html"
-        render_html(findings, mem, points, out, lang)
+        render_html(findings, mem, points, out, lang, breakdown)
         print(f"  {S.CYA}{out}{S.R}\n")
         webbrowser.open(f"file://{out}")
 

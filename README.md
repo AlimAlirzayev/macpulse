@@ -98,13 +98,36 @@ if set, else `~/Documents/OS-Output` if that folder exists, else `~/Documents/ma
 
 - **AI session age.** The Claude Code finding shows how long each session has been up.
 
+## What's new in 1.5
+
+- **Honest menu bar.** When a scan could not measure everything (`"complete": false` in
+  `--json`), the title shows `◍ 100?` and the menu names what was skipped. The menu also
+  shows the largest score deduction. `MACPULSE_BIN` points the agent at another CLI, and
+  `macpulse-menubar --print-title` prints the title it would show and exits.
+- **Idle AI sessions.** A Claude Code session open 12 h or more that has used under 0.5%
+  of a core over its lifetime is reported as `ai:idle`, never the session running the scan.
+  Its fix sends SIGTERM to exactly those PIDs, and it is excluded from `--fix --yes` and
+  the panel's "fix all" (`auto_fix: false` in `--json`): you stop sessions on purpose.
+- **Swap growth.** A warning when swap used grew by 1 GiB or more within 30 minutes,
+  judged from the scan history.
+- **Verifiable release.** `release.sh` writes `SHA256SUMS` (committed) and a CycloneDX 1.5
+  `sbom.cdx.json` (a release asset, no dependencies). When `install.sh` downloads, it
+  fetches `SHA256SUMS`, checks every file in a staging folder and installs nothing on a
+  mismatch or if the list is missing.
+
+Honest limit: releases are checksummed and carry an SBOM, but they are **not
+Apple-notarized or code-signed**; that needs a paid Developer ID. A checksum shows the files
+match the published list. It does not prove who published the list. The menu bar app is
+built on your machine for the same reason as before, so Gatekeeper does not apply to it.
+
 ### Tests
 
 ```
 python3 -m unittest discover -s tests
 ```
 
-Offline, stdlib only, a couple of seconds. They exercise pure functions on fixtures
+Offline, stdlib only, a few seconds. A few tests compile `menubar.m` (skipped without
+`clang`) and run `install.sh` against a sandbox HOME. They exercise pure functions on fixtures
 (including a replay of the incident this tool was built after: 8 GB RAM, 8.4 GB of swap,
 306 MB of disk free) and drive the MCP server in-process. They do not run a live scan,
 so they cannot catch a regression that only shows up against a real machine's

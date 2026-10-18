@@ -119,6 +119,17 @@ def record(score, mem, findings):
     return ages
 
 
+def swap_samples(since_ts):
+    """[(ts, swap_used_gb), ...] recorded at or after since_ts, oldest first."""
+    try:
+        with _connect() as con:
+            rows = con.execute("SELECT ts, swap_used_gb FROM samples WHERE ts >= ? "
+                               "AND swap_used_gb IS NOT NULL ORDER BY ts", (since_ts,)).fetchall()
+        return [(r["ts"], r["swap_used_gb"]) for r in rows]
+    except sqlite3.Error:
+        return []
+
+
 def trend(days=14, buckets=14):
     """Score over time, oldest first, as (label, score) — for a sparkline."""
     now = time.time()
