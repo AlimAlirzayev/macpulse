@@ -98,6 +98,12 @@ if set, else `~/Documents/OS-Output` if that folder exists, else `~/Documents/ma
 
 - **AI session age.** The Claude Code finding shows how long each session has been up.
 
+## 1.5.2
+
+- A Claude Code session whose child process (a build, a test run) is busy is no longer treated as idle.
+- The menu bar agent drops finding fields of the wrong type instead of crashing on them.
+- The process-tree walk is cycle-safe (a self-parented pid could hang a scan).
+
 ## 1.5.1 (fixes from the release review)
 
 - A scan whose swap sensor failed no longer records 0 GB, so the next scan cannot raise a false swap-growth warning.

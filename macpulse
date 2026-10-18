@@ -54,7 +54,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from macpulse_strings import LANGS, FALLBACK, bundle, t   # noqa: E402
 import macpulse_history as hist                            # noqa: E402
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # sysctl, memory_pressure and vm_stat live in /usr/sbin and /usr/bin. launchd agents and
 # AI-assistant hooks start with a minimal PATH, where the scan used to crash on its very
@@ -214,9 +214,14 @@ def descendants(procs, root_pid):
     by_parent = {}
     for p in procs:
         by_parent.setdefault(p.ppid, []).append(p)
-    out, stack = [], [root_pid]
+    # `seen` makes a cycle harmless: pid 1 listed as its own parent (or a pid reused
+    # between the ps rows) would otherwise loop forever and hang the scan.
+    out, stack, seen = [], [root_pid], {root_pid}
     while stack:
         for child in by_parent.get(stack.pop(), []):
+            if child.pid in seen:
+                continue
+            seen.add(child.pid)
             out.append(child)
             stack.append(child.pid)
     return out
@@ -1135,8 +1140,9 @@ def idle_sessions(procs, own_pids):
             if p.user == me and _is_claude_binary(p) and not PROTECTED.search(p.cmd)
             and p.pid not in own and p.elapsed >= IDLE_MIN_AGE_S
             and p.cputime / max(p.elapsed, 1) < IDLE_MAX_CPU_SHARE
-            # quiet over its lifetime is not enough: a session busy right now is in use
-            and p.cpu < IDLE_MAX_CPU_NOW]
+            # quiet over its lifetime is not enough: a session busy right now is in use,
+            # and so is one whose tool run (a child: build, test suite) is burning CPU
+            and p.cpu + sum(k.cpu for k in descendants(procs, p.pid)) < IDLE_MAX_CPU_NOW]
 
 
 def _is_claude_binary(p):

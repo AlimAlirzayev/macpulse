@@ -153,3 +153,27 @@ class RoundFiveRegressions(unittest.TestCase):
         t0 = time.time() - 1
         mp.hist.record(90, mem, [])
         self.assertEqual([s for s in mp.hist.swap_samples(t0)], [])
+
+
+class RoundSixRegressions(unittest.TestCase):
+    def test_session_whose_child_is_busy_is_kept(self):
+        host = proc(10, 20, cpu_s=0)
+        child = mp.Proc(11, 10, 85.0, 50_000, 600, 500, ME, "/bin/zsh -c pytest")
+        self.assertEqual(mp.idle_sessions([host, child], set()), [])
+
+    def test_session_with_quiet_children_is_still_idle(self):
+        host = proc(10, 20, cpu_s=0)
+        child = mp.Proc(11, 10, 0.0, 50_000, 20 * H, 1, ME, "node mcp-server")
+        self.assertEqual([p.pid for p in mp.idle_sessions([host, child], set())], [10])
+
+
+class ProcessTreeCycles(unittest.TestCase):
+    def test_self_parented_pid_does_not_hang(self):
+        a = mp.Proc(1, 1, 0.0, 1, 10, 0, ME, "/sbin/launchd")
+        b = mp.Proc(5, 1, 0.0, 1, 10, 0, ME, "x")
+        self.assertEqual(sorted(p.pid for p in mp.descendants([a, b], 1)), [5])
+
+    def test_two_pid_cycle_does_not_hang(self):
+        a = mp.Proc(7, 8, 0.0, 1, 10, 0, ME, "a")
+        b = mp.Proc(8, 7, 0.0, 1, 10, 0, ME, "b")
+        self.assertEqual(sorted(p.pid for p in mp.descendants([a, b], 7)), [8])

@@ -113,6 +113,26 @@ static BOOL IsNumber(id v) { return [v isKindOfClass:NSNumber.class]; }
 // Drop every JSON null (NSNull) at parse time, recursively. A missing key then reads as
 // nil, which the `?:` fallbacks and nil-messaging already handle; an NSNull would raise
 // on the first doubleValue / string use and take the whole agent down.
+// Wrong types are as fatal as nulls: a number where a title should be raises on the
+// first string call (refuter, round 6). Findings keep only fields of the type the menu
+// uses; a finding that is not a dictionary is dropped.
+static NSDictionary *SanitizePayload(NSDictionary *payload) {
+    NSArray *raw = [payload[@"findings"] isKindOfClass:NSArray.class] ? payload[@"findings"] : nil;
+    if (!raw) return payload;
+    NSMutableArray *clean = [NSMutableArray array];
+    for (id f in raw) {
+        if (![f isKindOfClass:NSDictionary.class]) continue;
+        NSMutableDictionary *g = [NSMutableDictionary dictionary];
+        for (NSString *k in @[@"key", @"severity", @"title", @"detail"])
+            if ([f[k] isKindOfClass:NSString.class]) g[k] = f[k];
+        if ([f[@"age_days"] isKindOfClass:NSNumber.class]) g[@"age_days"] = f[@"age_days"];
+        [clean addObject:g];
+    }
+    NSMutableDictionary *out = [payload mutableCopy];
+    out[@"findings"] = clean;
+    return out;
+}
+
 static id StripNulls(id obj) {
     if ([obj isKindOfClass:NSDictionary.class]) {
         NSMutableDictionary *out = [NSMutableDictionary dictionary];
@@ -151,7 +171,7 @@ static NSDictionary *RunScan(BOOL loginShell) {
     }
     id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
     obj = StripNulls(obj);
-    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+    return [obj isKindOfClass:NSDictionary.class] ? SanitizePayload(obj) : nil;
 }
 
 @interface MPAgent : NSObject <NSApplicationDelegate>
